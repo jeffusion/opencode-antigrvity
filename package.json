@@ -36,13 +36,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "prebuild": "bun run scripts/clean.ts",
-    "build": "bun run --bun tsc -p tsconfig.json",
-    "pretest": "bun run build",
+    "precompile": "bun run scripts/clean.ts",
+    "compile": "bun run --bun tsc -p tsconfig.json",
+    "pretest": "bun run compile",
     "test": "bun test test",
     "test:live": "OPENCODE_ANTIGRAVITY_ACP_LIVE=1 bun test test/acp-live.test.ts",
-    "check": "bun run build && bun test test",
-    "prepack": "bun run build",
+    "check": "bun run compile && bun test test",
     "prepublishOnly": "bun run check"
   },
   "dependencies": {

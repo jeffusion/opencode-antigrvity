@@ -22,7 +22,20 @@ describe("Bun-only project tooling", () => {
     for (const command of commands) {
       expect(command).not.toMatch(/(?:^|[\s;&|])(?:node|npm|npx)(?:\s|$)/i);
     }
-    expect(manifest.scripts.build).toContain("bun run --bun tsc");
+    expect(manifest.scripts.compile).toContain("bun run --bun tsc");
+    expect(manifest.scripts.precompile).toBe("bun run scripts/clean.ts");
+    expect(manifest.scripts.pretest).toBe("bun run compile");
+    expect(manifest.scripts.check).toBe("bun run compile && bun test test");
+    expect(manifest.scripts.prepublishOnly).toBe("bun run check");
+    for (const script of ["build", "prepack", "prepare", "preinstall", "install", "postinstall"]) {
+      expect(manifest.scripts).not.toHaveProperty(script);
+    }
+    for (const entry of Object.values(manifest.exports) as { import: string; default: string }[]) {
+      for (const file of [entry.import, entry.default]) {
+        expect(file).toStartWith("./src/");
+        expect(await Bun.file(new URL(file, root)).exists()).toBe(true);
+      }
+    }
 
     const workflow = await Bun.file(new URL(".github/workflows/windows.yml", root)).text();
     const ciPins = [...workflow.matchAll(/bun-version:\s*([^\s]+)/g)].map((match) => match[1]);

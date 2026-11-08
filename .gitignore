@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.codegraph/
+.cortexkit/
 .env
 .env.*
 coverage/

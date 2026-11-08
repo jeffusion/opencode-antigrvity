@@ -22,7 +22,7 @@ bun run check
 Edit TypeScript in `src/` and add regression tests in `test/`.
 
 ```sh
-bun run build                     # Type-check and emit dist/ declarations and JS
+bun run compile                   # Type-check and emit dist/ declarations and JS
 bun test test                     # Run tests without rebuilding
 bun test test/protocol.test.ts     # Run one test file
 bun test --watch test              # Re-run tests as files change
@@ -38,6 +38,13 @@ and tests use Bun's Node.js API compatibility layer; they do not launch or
 require the Node executable. TypeScript and the fake ACP test executable are
 explicitly run with Bun. `@types/node` remains only to type-check those
 compatible APIs; it does not add a Node runtime requirement.
+
+This fork intentionally omits `build`, `prepack`, `prepare`, `preinstall`,
+`install`, and `postinstall` scripts to avoid triggering pacote's embedded npm
+Git preparation flow; runtime exports use `src/` and need no consumer-side build.
+Before manually running `npm pack` or `bun pm pack`, run `bun run compile` to
+generate `dist/`: packing no longer does this automatically. `npm publish` still
+runs compilation and checks through `prepublishOnly` (`bun run check`).
 
 Bun skips dependency lifecycle scripts unless a package is explicitly trusted.
 Do not trust dependencies broadly: Koffi's optional platform package supplies
