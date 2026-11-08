@@ -349,13 +349,22 @@ export class SessionStore {
     } finally { await releaseLocks(unlock, release); }
   }
 
-  async saveToolResult(key: string, id: string, result: unknown): Promise<void> {
+  async saveToolResult(key: string, id: string, result: unknown, stage: "direct" | "profile-change" | "active-results" | "inactive-trailing" | "history-reconciliation" = "direct"): Promise<void> {
     const unlock = await this.lockTurn(`tool-result:${key}:${id}`, 5000);
     try {
     const call = await this.toolCall(key, id);
     if (!call) throw new AgyError("invalid_request", "Tool result has no durable originating call");
-    const resultDigest = digest(canonical(result));
-    if (call.resultDigest && call.resultDigest !== resultDigest) throw new AgyError("invalid_request", "Conflicting result for completed tool call");
+    const resultCanonical = canonical(result);
+    const resultDigest = digest(resultCanonical);
+    if (call.resultDigest && call.resultDigest !== resultDigest) {
+      const diagnostic = {
+        callID: id, stage, delivery: call.delivery ?? null, payloadExpired: call.payloadExpired ?? false,
+        previousDigest: call.resultDigest, incomingDigest: resultDigest,
+        previousBytes: call.payloadExpired || call.result === undefined ? null : Buffer.byteLength(canonical(call.result), "utf8"),
+        incomingBytes: Buffer.byteLength(resultCanonical, "utf8"),
+      };
+      throw new AgyError("invalid_request", `Conflicting result for completed tool call ${JSON.stringify(diagnostic)}`);
+    }
     await this.saveToolCall(key, id, { ...call, result, resultDigest, delivery: call.delivery ?? "result-persisted", payloadExpired: false });
     } finally { await unlock(); }
   }

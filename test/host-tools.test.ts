@@ -9,6 +9,8 @@ const Effect = await import(Bun.resolveSync("effect/Effect", dirname(import.meta
 import { SESSION_HEADER } from "../src/constants.js";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 import { sessionStore } from "../src/session-store.js";
+import { canonical } from "../src/coordinator.js";
+import { createHash } from "node:crypto";
 let compatibility: ReturnType<typeof fixtureCompatibility>;
 
 const directory = await mkdtemp(join(tmpdir(), "agy-host-tools-"));
@@ -320,10 +322,43 @@ test("conflicting persisted results are terminal and private to their conversati
   const { SessionStore } = await import("../src/session-store.js");
   const store = new SessionStore();
   await store.saveToolCall("durable-test", "call", { call: { id: "call", name: "shell", input: {} }, emitted: true });
-  const completed = { content: [{ type: "text", text: "ONCE" }], isError: false };
+  const secret = "PRIVATE_RESULT_私密🔒";
+  const image = Buffer.from("PRIVATE_IMAGE_DATA").toString("base64");
+  const completed = { content: [{ type: "text", text: secret }, { type: "image", data: image, mimeType: "image/png" }], isError: false };
   await Promise.all([store.saveToolResult("durable-test", "call", completed), store.saveToolResult("durable-test", "call", completed)]);
-  await expect(store.saveToolResult("durable-test", "call", { content: [{ type: "text", text: "CONFLICT" }], isError: false })).rejects.toThrow("Conflicting");
+  const incoming = { content: [{ type: "text", text: "CHANGED_PRIVATE_机密" }], isError: false };
+  let error: any;
+  try { await store.saveToolResult("durable-test", "call", incoming, "history-reconciliation"); } catch (caught) { error = caught; }
+  expect(error?.message).toStartWith("Conflicting result for completed tool call ");
+  expect(error?.status).toBe(400);
+  expect(error?.code).toBe("agy_invalid_request");
+  expect(error?.retryable).toBe(false);
+  const hash = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
+  expect(JSON.parse(error.message.slice(error.message.indexOf("{")))).toEqual({
+    callID: "call", stage: "history-reconciliation", delivery: "result-persisted", payloadExpired: false,
+    previousDigest: hash(completed), incomingDigest: hash(incoming),
+    previousBytes: Buffer.byteLength(canonical(completed), "utf8"), incomingBytes: Buffer.byteLength(canonical(incoming), "utf8"),
+  });
+  expect(Buffer.byteLength(canonical(incoming), "utf8")).toBeGreaterThan(canonical(incoming).length);
+  for (const value of [secret, image, incoming.content[0].text, "durable-test"]) expect(JSON.stringify(error)).not.toContain(value);
+  for (const value of [secret, image, incoming.content[0].text, "durable-test"]) expect(error.message).not.toContain(value);
+  expect((await store.toolCall("durable-test", "call"))?.result).toEqual(completed);
+  expect((await store.toolCall("durable-test", "call"))?.resultDigest).toBe(hash(completed));
   await expect(store.saveToolResult("another-session", "call", completed)).rejects.toThrow("originating");
+
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP" }];
+  const first = await (await send("http-result-conflict", messages)).json();
+  const id = first.content[0].id;
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(id, secret)] });
+  expect((await send("http-result-conflict", messages)).status).toBe(200);
+  messages.at(-1).content = [result(id, incoming.content[0].text)];
+  const response = await send("http-result-conflict", messages);
+  expect(response.status).toBe(400);
+  const payload = await response.json();
+  expect(payload.error.code).toBe("agy_invalid_request");
+  expect(payload.error.message).toContain(`"callID":"${id}"`);
+  expect(payload.error.message).toContain('"stage":"inactive-trailing"');
+  for (const value of [secret, incoming.content[0].text]) expect(JSON.stringify(payload)).not.toContain(value);
 });
 
 test("failed durable file sync cannot acknowledge a tool result", async () => {

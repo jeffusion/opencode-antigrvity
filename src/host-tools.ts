@@ -224,7 +224,7 @@ export class HostBridge {
         // Accept under the originating profile/instructions before retiring its waiter. The
         // replacement prompt imports host calls/results; it never reissues them.
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
-        for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result);
+        for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result, "profile-change");
         if ([...this.reported].every(id => results.has(id) || this.pending.get(id)?.result)) {
           await this.close();
           yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
@@ -235,7 +235,7 @@ export class HostBridge {
       if (this.active) {
         // Validate the whole group before releasing any MCP handler.
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
-        for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result);
+        for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result, "active-results");
         for (const [id, result] of results) { const pending = this.pending.get(id); if (pending) pending.result = result; }
         if (this.turn?.messages && Array.isArray(input.messages)) this.turn.messages.splice(0, this.turn.messages.length, ...input.messages);
         if (this.turn?.responseCursor) this.turn.responseCursor.start = this.turn.responseCursor.events;
@@ -282,7 +282,7 @@ export class HostBridge {
       } else {
         for (const [id, result] of results) {
           if (!(await sessionStore.toolCall(this.key, id))) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
-          await sessionStore.saveToolResult(this.key, id, result);
+          await sessionStore.saveToolResult(this.key, id, result, "inactive-trailing");
         }
         // A dead MCP transport cannot be resumed. Recover its last host batch
         // from private receipts and host results. Missing results do not prove
@@ -317,7 +317,7 @@ export class HostBridge {
               const result = hostResults([message]).get(call.id);
               if (!result) continue;
               hasHostResult = true;
-              await sessionStore.saveToolResult(this.key, call.id, result);
+              await sessionStore.saveToolResult(this.key, call.id, result, "history-reconciliation");
             }
             const reconciled = await sessionStore.toolCall(this.key, call.id);
             if (!reconciled?.result) missing.push(call);

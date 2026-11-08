@@ -46,3 +46,38 @@ test("tool V2 validates versions, ownership, profile and digests on every read; 
     else process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = previous;
   }
 });
+
+test("expired tool results retain conflict diagnostics without a stored payload", async () => {
+  const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+  process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/tool-record-expired-`);
+  try {
+    const store = new SessionStore();
+    const original = { content: [{ type: "text", text: "EXPIRED_PRIVATE_私密" }], isError: false };
+    const resultDigest = hash(canonical(original));
+    await store.saveToolCall("expired-key", "expired-call", {
+      call: { id: "expired-call", name: "read", input: {} }, resultDigest,
+      payloadExpired: true, delivery: "locally-handed-off",
+    });
+    const incoming = { content: [], isError: false };
+    let error: any;
+    try { await store.saveToolResult("expired-key", "expired-call", incoming); } catch (caught) { error = caught; }
+    expect(error?.code).toBe("agy_invalid_request");
+    expect(error?.status).toBe(400);
+    expect(error?.retryable).toBe(false);
+    expect(error?.message).toStartWith("Conflicting result for completed tool call ");
+    expect(JSON.parse(error.message.slice(error.message.indexOf("{")))).toEqual({
+      callID: "expired-call", stage: "direct", delivery: "locally-handed-off", payloadExpired: true,
+      previousDigest: resultDigest, incomingDigest: hash(canonical(incoming)), previousBytes: null,
+      incomingBytes: Buffer.byteLength(canonical(incoming), "utf8"),
+    });
+    expect(error.message).not.toContain(original.content[0].text);
+    expect(error.message).not.toContain("expired-key");
+    const saved = await store.toolCall("expired-key", "expired-call");
+    expect(saved?.result).toBeUndefined();
+    expect(saved?.resultDigest).toBe(resultDigest);
+    expect(saved?.payloadExpired).toBe(true);
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+    else process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = previous;
+  }
+});
