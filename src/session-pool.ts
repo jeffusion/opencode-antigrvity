@@ -15,6 +15,7 @@ import {
 } from "./constants.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AcpEvent } from "./acp-process.js";
+import { HarnessFailureGuard } from "./protocol.js";
 import { buildBoundedHistory, extractTextContent, messageContentToAcp, hostResultMessageToAcp, type HostMessage } from "./prompt.js";
 import { canonical, extendsBoundary, fingerprints, type ConversationState } from "./coordinator.js";
 import { ownershipKey, sessionStore, type SessionRecord } from "./session-store.js";
@@ -198,7 +199,27 @@ export class SessionPool {
         })).digest("hex");
         const receipt = await sessionStore.receipt(request.key, identity);
         if (receipt && receipt.state !== "rejected-before-execution" && receipt.state !== "prepared") {
-          if (receipt.state === "completed" && receipt.events) { yield* receipt.events; return; }
+          if (receipt.state === "completed" && receipt.events) {
+            try {
+              const guard = new HarnessFailureGuard();
+              for (const event of receipt.events) guard.push(event);
+            } catch (error) {
+              await entry.worker?.stop(true);
+              entry.worker = undefined;
+              entry.historyTransferred = false;
+              entry.settingsSignature = undefined;
+              const record = await sessionStore.get(request.key);
+              if (record?.conversation) {
+                record.conversation.resumable = false;
+                entry.conversation = record.conversation;
+                entry.record = record;
+                await sessionStore.set(request.key, record);
+              }
+              throw error;
+            }
+            yield* receipt.events;
+            return;
+          }
           if (receipt.state === "completed") throw new AgyError("invalid_request", "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again.", { code: "agy_completed_response_unavailable" });
           throw new AgyError("invalid_request", "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
         }

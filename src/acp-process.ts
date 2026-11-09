@@ -19,6 +19,7 @@ import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { cliAuthenticationError, requireCliAuthentication } from "./auth-bridge.js";
 import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
+import { HarnessFailureGuard, isHarnessFailure } from "./protocol.js";
 import { catalogFromSession, type AcpModelCatalog } from "./models.js";
 import { emitAcpCatalog } from "./catalog-events.js";
 import { hostEnvironment } from "./host-environment.js";
@@ -161,6 +162,7 @@ function createTurnActivityWatchdog(timeoutMs: number, onTimeout: () => void, pa
 function asAcpError(error: unknown, fallback: string): AgyError {
   if (error instanceof AgyError) return error;
   const message = error instanceof Error ? error.message : String(error);
+  if (isHarnessFailure(message)) return new AgyProcessError(message, error);
   const rpc = error && typeof error === "object" ? error as { code?: unknown; data?: unknown } : {};
   const data = rpc.data && typeof rpc.data === "object" ? rpc.data as Record<string, unknown> : {};
   const inner = data.error && typeof data.error === "object" ? data.error as Record<string, unknown> : {};
@@ -474,14 +476,16 @@ export class AcpWorker {
         },
       );
       try {
+        const guard = new HarnessFailureGuard();
         while (true) {
           const next = await this.turnEvents.next({ signal: turnController.signal });
           if (next.done) break;
           if (next.value.event === "result") {
+            yield* guard.flush();
             result = next.value.result;
             break;
           }
-          yield next.value;
+          yield* guard.push(next.value);
         }
       } finally {
         signal?.removeEventListener("abort", abort);

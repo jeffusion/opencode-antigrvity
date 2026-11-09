@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { chmod, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { startProxy, stopProxy, getProxyBaseUrl } from "../src/proxy.js";
@@ -37,6 +37,46 @@ const send = (session: string, messages: any[], extra: Record<string, unknown> =
   body: JSON.stringify({ model: "gemini-3.8-flash", tools: schema, system: "HOST_INSTRUCTIONS_UNTRUNCATED", messages, ...extra }),
 });
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
+
+test("harness failure after a real host tool handoff never repeats the host side effect", async () => {
+  const host = "host-harness-fatal";
+  const headers = { "x-opencode-antigravity-message": "host-harness-fatal-request" };
+  const counter = join(directory, "host-harness-fatal.effects");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP_HARNESS_FATAL" }];
+  const first = await (await send(host, messages, {}, headers)).json();
+  expect(first.stop_reason).toBe("tool_use");
+  const call = first.content.find((p: any) => p.type === "tool_use");
+  // Execute the exposed host operation once before returning its actual result.
+  await appendFile(counter, "executed\n");
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "HOST_SIDE_EFFECT_DONE")] });
+  const failed = await send(host, messages, {}, headers);
+  const failure = await failed.json();
+  expect(failed.status).toBe(502);
+  expect(failure.error.code).toBe("agy_process_error");
+  expect(failure.content).toBeUndefined();
+  const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+  const saved = (await sessionStore.toolCall(key, call.id))!;
+  expect(saved.delivery).toBe("locally-handed-off");
+  expect(saved.result?.content).toEqual([{ type: "text", text: "HOST_SIDE_EFFECT_DONE" }]);
+  expect(saved.resultDigest).toBeString();
+  expect((await sessionStore.receipt(key, String(saved.requestId)))?.state).toBe("uncertain");
+  const count = await promptLines();
+  const retry = await send(host, messages, {}, headers);
+  const retried = await retry.json();
+  expect(retry.status).toBe(400);
+  expect(retried.error.message).toContain("already started");
+  expect(retried.content).toBeUndefined();
+  expect(await promptLines()).toBe(count);
+  messages.push({ role: "user", content: "Continue from the recorded result without repeating the operation." });
+  const resumed = await (await send(host, messages)).json();
+  expect(resumed.stop_reason).toBe("end_turn");
+  expect(resumed.content.some((p: any) => p.type === "tool_use")).toBe(false);
+  const after = (await sessionStore.toolCall(key, call.id))!;
+  expect(after.result).toEqual(saved.result);
+  expect(after.resultDigest).toBe(saved.resultDigest);
+  expect(after.delivery).toBe(saved.delivery);
+  expect(await readFile(counter, "utf8")).toBe("executed\n");
+});
 
 test("delivered history input and output are display views without ledger writes or payload restoration", async () => {
   const host = "history-display";

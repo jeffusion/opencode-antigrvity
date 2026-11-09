@@ -59,6 +59,22 @@ async function handlePrompt(message) {
   const text = textFromPrompt(message.params?.prompt);
   if (process.env.FAKE_ACP_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG, JSON.stringify({ text, prompt: message.params?.prompt }) + "\n");
   activePrompt = { id, cancelled: false };
+  if (process.env.FAKE_ACP_REPLAY_FILE) {
+    const receipt = JSON.parse(fs.readFileSync(process.env.FAKE_ACP_REPLAY_FILE, "utf8"));
+    for (const event of receipt.events) {
+      if (event.event === "update") update(event.update);
+      else if (event.event === "result") { respond(id, event.result); activePrompt = undefined; return; }
+    }
+  }
+  if (text.includes("FAKE_HARNESS_FAILURE")) {
+    fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG + ".effects", "effect\n");
+    const failure = "Agent execution error: Harness process exited unexpectedly (WS close code 1011).\nHarness stderr:\ncontext canceled";
+    if (text.includes("RPC")) fail(id, -32000, failure);
+    else for (const chunk of text.includes("SPLIT") ? [...failure] : [failure]) update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: chunk } });
+    if (!text.includes("RPC")) respond(id, { stopReason: "end_turn" });
+    activePrompt = undefined;
+    return;
+  }
   if (text.includes("FAKE_INTERNAL_COMPACTION")) {
     update({ sessionUpdate: "usage_update", used: 950, size: 1000 });
     update({ sessionUpdate: "compaction_update", compactionId: "fake-internal", status: "in_progress" });
@@ -107,6 +123,10 @@ async function handlePrompt(message) {
     const count = text.includes("FAKE_MCP_PARALLEL") ? 2 : 1;
     const results = await Promise.all(Array.from({ length: count }, (_, index) => rpc("tools/call", { name, arguments: { index } })));
     if (process.env.FAKE_ACP_MCP_RESULT_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_RESULT_LOG, JSON.stringify(results) + "\n");
+    if (text.includes("FAKE_MCP_HARNESS_FATAL")) {
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Agent execution error: Harness process exited unexpectedly (WS close code 1011).\nHarness stderr:\ncontext canceled" } });
+      respond(id, { stopReason: "end_turn" }); activePrompt = undefined; return;
+    }
     if (text.includes("FAKE_MCP_QUOTA")) {
       fail(id, -32000, "quota exceeded after tool work", { execution: "rejected-before-execution" });
       activePrompt = undefined; return;

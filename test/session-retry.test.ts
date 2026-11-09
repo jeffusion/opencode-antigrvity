@@ -4,8 +4,10 @@ useFixtureAuthentication();
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { SessionPool, type SessionTurnRequest } from "../src/session-pool.js";
 import { SessionStore } from "../src/session-store.js";
+import { HarnessFailureGuard, type AcpEvent } from "../src/protocol.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const pools: SessionPool[] = [];
@@ -52,6 +54,65 @@ test("replays completed requests across pools, even after a newer message", asyn
   await collect(second.turn(request("two")));
   expect(await collect(second.turn(request("one")))).toEqual(original);
   expect(await promptCount(directory)).toBe(2);
+});
+
+const failureHeader = "Agent execution error: Harness process exited unexpectedly (WS close code 1011).\nHarness stderr:\n";
+const textEvent = (text: string): AcpEvent => ({ event: "update", sessionId: "test", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } });
+
+test("harness envelope guard is bounded, ordered and only matches segment starts", () => {
+  for (const text of ["Explanation: " + failureHeader, "Quoted: \"" + failureHeader, "Agent execution error: a normal tool failed", failureHeader.slice(0, -2)]) {
+    const guard = new HarnessFailureGuard();
+    const events = [...text].map(textEvent);
+    const output = events.flatMap(event => guard.push(event));
+    output.push(...guard.flush());
+    expect(output).toEqual(events);
+  }
+  const guard = new HarnessFailureGuard();
+  const partial = textEvent("Agent execution error:");
+  const usage = { event: "update", sessionId: "test", update: { sessionUpdate: "usage_update", used: 1, size: 10 } } as AcpEvent;
+  expect(guard.push(partial)).toEqual([]);
+  expect(guard.push(usage)).toEqual([partial, usage]);
+  expect(() => guard.push(textEvent(failureHeader))).toThrow("Harness process exited unexpectedly");
+});
+
+test("live harness envelopes fail as process errors without output, success or repeated side effects", async () => {
+  for (const mode of ["WHOLE", "SPLIT", "RPC"]) {
+    const directory = await setup();
+    const sessions = pool();
+    const req = request("harness", `FAKE_HARNESS_FAILURE ${mode}`);
+    const seen: unknown[] = [];
+    let caught: any;
+    try { for await (const event of sessions.turn(req)) seen.push(event); } catch (error) { caught = error; }
+    expect(caught?.kind).toBe("process");
+    expect(caught?.message).toBe(failureHeader + (mode === "SPLIT" ? "" : "context canceled"));
+    expect(seen).toEqual([]);
+    expect((await sessions.status("session")).workerState).toBe("closed");
+    expect((await new SessionStore().receipt("session", "harness"))?.state).toBe("uncertain");
+    await expect(collect(sessions.turn(req))).rejects.toThrow("already started");
+    expect(await readFile(join(directory, "prompts.jsonl.effects"), "utf8")).toBe("effect\n");
+    expect(await promptCount(directory)).toBe(1);
+  }
+});
+
+test("legacy harness receipt is rejected before yield without mutating receipt or permitting resume", async () => {
+  const directory = await setup();
+  const sessions = pool();
+  await collect(sessions.turn(request("normal")));
+  const store = new SessionStore();
+  const events: AcpEvent[] = [textEvent("Earlier normal content"), { event: "update", sessionId: "test", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: "boundary", status: "completed" } }, textEvent(failureHeader + "context canceled"), { event: "result", sessionId: "test", result: { stopReason: "end_turn" } }];
+  await store.saveReceipt("session", "legacy", { state: "completed", events });
+  const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+  const receiptPath = join(directory, "requests", hash("session"), hash("legacy") + ".json");
+  const originalBytes = await readFile(receiptPath);
+  const before = await store.receipt("session", "legacy");
+  const seen: unknown[] = [];
+  await expect((async () => { for await (const event of sessions.turn(request("legacy"))) seen.push(event); })()).rejects.toThrow("Harness process exited unexpectedly");
+  expect(seen).toEqual([]);
+  expect(await store.receipt("session", "legacy")).toEqual(before);
+  expect(await readFile(receiptPath)).toEqual(originalBytes);
+  expect((await sessions.status("session")).workerState).toBe("none");
+  expect((await store.get("session"))?.conversation?.resumable).toBe(false);
+  expect(await promptCount(directory)).toBe(1);
 });
 
 test("rejects uncertain retries after failure without sending another prompt", async () => {
