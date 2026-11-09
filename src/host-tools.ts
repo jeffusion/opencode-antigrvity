@@ -6,7 +6,7 @@ import type { AcpEvent, ContextOccupancy } from "./protocol.js";
 import { extractTextContent, messageContentToAcp, normalizePrompt, type HostMessage } from "./prompt.js";
 import { envNumber, HOST_MCP_SERVER_NAME } from "./constants.js";
 import { sessionStore } from "./session-store.js";
-import { canonical } from "./coordinator.js";
+import { canonical, extendsBoundary, fingerprints } from "./coordinator.js";
 import { freezeContextOccupancy } from "./telemetry.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { MAX_MEDIA_BYTES, validateMediaBlocks } from "./attachments.js";
@@ -158,6 +158,7 @@ export class HostBridge {
   private instructions = "";
   private closing?: Promise<void>;
   private turn?: SessionTurnRequest;
+  private acceptedBoundary: string[] = [];
   private callCount = 0;
   private readonly sessions: Pick<SessionPool, "turn" | "forgetWorker">;
   private readonly now: () => number;
@@ -204,13 +205,44 @@ export class HostBridge {
     try {
       if (input.signal?.aborted) throw new AgyAbortError();
       const results = hostResults(input.messages);
+      const messagesView = Array.isArray(input.messages) ? input.messages : [];
+      const parts = messagesView.flatMap(m => m?.role === "assistant" && Array.isArray(m.content) ? m.content : []);
+      const latestAssistant = [...messagesView].reverse().find(m => m?.role === "assistant");
+      const currentGroup = new Set<string>(Array.isArray(latestAssistant?.content) ? latestAssistant.content.filter((p: any) => p?.type === "tool_use").map((p: any) => p.id) : []);
+      // Freeze eligibility before this request persists any current results.
+      const history = new Set<string>();
+      const records = new Map<string, Awaited<ReturnType<typeof sessionStore.toolCall>>>();
+      for (const id of new Set<string>([...results.keys(), ...parts.filter(p => typeof p?.id === "string").map(p => p.id)])) {
+        const saved = await sessionStore.toolCall(this.key, id);
+        if (saved && saved.hostSessionID !== (this.sessionID ?? null)) throw new AgyError("invalid_request", "Tool call belongs to another host session");
+        records.set(id, saved);
+        if (saved?.hostSessionID === (this.sessionID ?? null) && saved.resultDigest && saved.delivery === "locally-handed-off" &&
+            !currentGroup.has(id) && !results.has(id) && !this.pending.has(id) && !this.reported.has(id)) history.add(id);
+      }
+      const validateCall = (call: any) => {
+        const saved = records.get(call.id);
+        if (saved && (history.has(call.id)
+          ? call.id !== saved.call.id || call.name !== saved.call.name || call.type !== saved.call.type
+          : canonical(saved.call) !== canonical(call))) throw new AgyError("invalid_request", "Tool call conflicts with its originating record");
+      };
+      for (const call of parts) if (records.get(call?.id)) validateCall(call);
+      for (const message of messagesView) {
+        if (message?.role !== "user") continue;
+        for (const [id, result] of hostResults([message])) {
+          const saved = records.get(id);
+          if (!history.has(id) && !results.has(id) && saved?.resultDigest && saved.resultDigest !== createHash("sha256").update(canonical(result)).digest("hex")) {
+            throw new AgyError("invalid_request", "Tool result conflicts with its originating record");
+          }
+        }
+      }
+      const boundary = fingerprints(messagesView);
+      const rewritten = this.active && !extendsBoundary(this.acceptedBoundary, boundary);
       // The ID alone is not authority to replace the originating arguments.
       for (const id of results.keys()) {
-        const saved = await sessionStore.toolCall(this.key, id);
+        const saved = records.get(id);
         if (!saved) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
-        const calls = Array.isArray(input.messages) ? input.messages.flatMap(m => m?.role === "assistant" && Array.isArray(m.content) ? m.content : []) : [];
-        const call = calls.find(p => p?.type === "tool_use" && p.id === id);
-        if (call && canonical(saved.call) !== canonical(call)) throw new AgyError("invalid_request", "Tool call conflicts with its originating record");
+        const call = parts.find(p => p?.type === "tool_use" && p.id === id);
+        if (call) validateCall(call);
       }
       const tools = parseHostTools(input.tools);
       const signature = profile(tools, input.settings);
@@ -220,7 +252,7 @@ export class HostBridge {
         // before persistence, not unrelated historical/settled result groups.
         validateMediaBlocks([...this.reported].flatMap(id => (results.get(id) ?? this.pending.get(id)?.result)?.content ?? []) as ContentBlock[]);
       }
-      if (this.active && (signature !== this.signature || nextInstructions !== this.instructions)) {
+      if (this.active && (rewritten || signature !== this.signature || nextInstructions !== this.instructions)) {
         // Accept under the originating profile/instructions before retiring its waiter. The
         // replacement prompt imports host calls/results; it never reissues them.
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
@@ -237,7 +269,6 @@ export class HostBridge {
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
         for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result, "active-results");
         for (const [id, result] of results) { const pending = this.pending.get(id); if (pending) pending.result = result; }
-        if (this.turn?.messages && Array.isArray(input.messages)) this.turn.messages.splice(0, this.turn.messages.length, ...input.messages);
         if (this.turn?.responseCursor) this.turn.responseCursor.start = this.turn.responseCursor.events;
         if (this.reported.size && [...this.reported].every((id) => this.pending.get(id)?.result)) {
           // Instruction/profile changes rebuild above. Deliver user steering
@@ -277,11 +308,13 @@ export class HostBridge {
             localDeliveries.set(result, { key: this.key, id });
             this.pending.delete(id); this.settled.add(id); pending.resolve(result);
           }
+          if (this.turn?.messages && Array.isArray(input.messages)) this.turn.messages.splice(0, this.turn.messages.length, ...input.messages);
+          this.acceptedBoundary = boundary;
           this.reported.clear(); this.instructions = nextInstructions;
         }
       } else {
         for (const [id, result] of results) {
-          if (!(await sessionStore.toolCall(this.key, id))) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
+          if (!records.get(id)) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
           await sessionStore.saveToolResult(this.key, id, result, "inactive-trailing");
         }
         // A dead MCP transport cannot be resumed. Recover its last host batch
@@ -298,16 +331,18 @@ export class HostBridge {
           const missing: HostCall[] = [];
           const restored: Record<string, unknown>[] = [];
           for (const call of calls) {
-            const saved = await sessionStore.toolCall(this.key, call.id);
+            const saved = records.get(call.id);
             if (!saved) {
               // Earlier history may belong to another provider, but the current
               // continuation must have an originating adapter call record.
               if (Array.isArray(assistant?.content) && assistant.content.includes(call)) throw new AgyError("invalid_request", "Tool call has no originating record in this conversation");
               continue;
             }
-            if (canonical(saved.call) !== canonical(call)) throw new AgyError("invalid_request", "Tool call conflicts with its originating record");
+            validateCall(call);
             if (seen.has(call.id)) continue;
             seen.add(call.id);
+            // Delivered history is a host-owned display view, not ledger evidence.
+            if (history.has(call.id)) continue;
             // Host context may already contain a result outside the trailing
             // continuation group. Reconcile that evidence before declaring the
             // original execution uncertain; do not ask the host to execute it.
@@ -320,6 +355,7 @@ export class HostBridge {
               await sessionStore.saveToolResult(this.key, call.id, result, "history-reconciliation");
             }
             const reconciled = await sessionStore.toolCall(this.key, call.id);
+            if (!reconciled?.result && reconciled?.resultDigest) throw new AgyError("invalid_request", "Previously executed tool result payload expired; restore the original result with the same digest before continuing. It cannot be executed again automatically.");
             if (!reconciled?.result) missing.push(call);
             else if (!hasHostResult) {
               const result = reconciled.result as ToolResult;
@@ -347,6 +383,7 @@ export class HostBridge {
           suppressToolTelemetry: true,
           priorMessages: normalized.priorMessages.filter((m) => m.role !== "system"), instructions: this.instructions, settings, signal: this.controller.signal };
         this.turn = turn;
+        this.acceptedBoundary = boundary;
         this.pumping = (async () => {
           try {
             for await (const event of this.sessions.turn(turn)) this.queue.push(event);

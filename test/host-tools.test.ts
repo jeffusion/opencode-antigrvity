@@ -38,6 +38,160 @@ const send = (session: string, messages: any[], extra: Record<string, unknown> =
 });
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
 
+test("delivered history input and output are display views without ledger writes or payload restoration", async () => {
+  const host = "history-display";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP HISTORY_DISPLAY" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((p: any) => p.type === "tool_use");
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "ORIGINAL_LARGE_RESULT")] });
+  const completed = await (await send(host, messages)).json();
+  const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+  const before = await sessionStore.toolCall(key, call.id);
+  messages[1].content = [{ ...call, input: { summary: "trimmed arguments" } }];
+  messages[2].content = [result(call.id, "trimmed output")];
+  messages.push({ role: "assistant", content: "Completed summary." }, { role: "user", content: "Continue from the shortened history." });
+  expect((await send(host, messages)).status).toBe(200);
+  expect(await sessionStore.toolCall(key, call.id)).toEqual(before);
+  const logged = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!;
+  expect(logged).toContain("trimmed output");
+  expect(logged).not.toContain("ORIGINAL_LARGE_RESULT");
+  // Expired delivered history still needs neither restoration nor execution.
+  await sessionStore.saveToolCall(key, call.id, { ...before!, result: undefined, payloadExpired: true });
+  await closeHostBridges(host);
+  messages.push({ role: "assistant", content: "History retained." }, { role: "user", content: "Continue again." });
+  expect((await send(host, messages)).status).toBe(200);
+  expect((await sessionStore.toolCall(key, call.id))?.payloadExpired).toBe(true);
+  for (const change of [{ name: "renamed" }, { type: "text" }]) {
+    const invalid = structuredClone(messages);
+    Object.assign(invalid[1].content[0], change);
+    expect((await send(host, invalid)).status).toBe(400);
+  }
+});
+
+test("active history rewrite waits for the full batch and leaves partial ACP history untouched", async () => {
+  const host = "history-active-partial";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP HISTORY_BASELINE" }];
+  const first = await (await send(host, messages)).json();
+  const oldCall = first.content.find((p: any) => p.type === "tool_use");
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(oldCall.id, "OLD_AUTHORITATIVE")] });
+  const completed = await (await send(host, messages)).json();
+  messages.push({ role: "assistant", content: completed.content }, { role: "user", content: "FAKE_MCP_PARALLEL HISTORY_NEW_BATCH" });
+  const batch = await (await sendParallel(host, messages)).json();
+  expect(batch.content).toHaveLength(2);
+  const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  const baseline = structuredClone((bridge as any).turn.messages);
+  messages[1].content = [{ ...oldCall, input: { shortened: true } }];
+  messages[2].content = [result(oldCall.id, "OLD_DISPLAY_ONLY")];
+  messages[3].content = "Completed summary.";
+  messages.push({ role: "assistant", content: batch.content }, { role: "user", content: [result(batch.content[0].id, "NEW_A")] });
+  const count = await promptLines();
+  expect((await send(host, messages)).status).toBe(400);
+  expect(hostBridge(key, host, directory)).toBe(bridge);
+  expect((bridge as any).turn.messages).toEqual(baseline);
+  expect(await promptLines()).toBe(count);
+  messages.at(-1).content = [result(batch.content[1].id, "NEW_B")];
+  const final = await (await send(host, messages)).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(final.content.some((p: any) => p.type === "tool_use")).toBe(false);
+  expect(hostBridge(key, host, directory)).not.toBe(bridge);
+  expect(await promptLines()).toBe(count + 1);
+  const logged = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!;
+  expect(logged).toContain("OLD_DISPLAY_ONLY");
+  expect(logged).not.toContain("OLD_AUTHORITATIVE");
+  expect(logged).toContain("NEW_A");
+  expect(logged).toContain("NEW_B");
+});
+
+test("pending partial batches reject changed arguments and changed persisted results", async () => {
+  for (const field of ["input", "output"]) {
+    const host = `history-strict-${field}`;
+    const messages: any[] = [{ role: "user", content: "FAKE_MCP_PARALLEL STRICT_PARTIAL" }];
+    const first = await (await sendParallel(host, messages)).json();
+    messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(first.content[0].id, "AUTHORITATIVE")] });
+    expect((await send(host, messages)).status).toBe(400);
+    if (field === "input") messages[1].content[0].input = { forged: true };
+    else messages[2].content[0].content = "CHANGED";
+    const rejected = await send(host, messages);
+    expect(rejected.status).toBe(400);
+    const body = await rejected.json();
+    expect(body.error.message).toMatch(/conflict/i);
+    expect(body.content).toBeUndefined();
+  }
+});
+
+test("wire-equivalent text and rotating cache markers reuse the active bridge", async () => {
+  const host = "history-wire-equivalent";
+  const messages: any[] = [{ role: "user", content: [{ type: "text", text: "FAKE_MCP WIRE_EQUIVALENT", cache_control: { type: "ephemeral" } }] }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((p: any) => p.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  const count = await promptLines();
+  messages[0].content = "FAKE_MCP WIRE_EQUIVALENT";
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "WIRE_RESULT"), { type: "text", text: "Continue", cache_control: { type: "ephemeral" } }] });
+  const final = await (await send(host, messages)).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(JSON.stringify(final.content)).toContain("WIRE_RESULT");
+  expect(hostBridge(key, host, directory)).toBe(bridge);
+  expect(await promptLines()).toBe(count);
+});
+
+test("latest handed-off call restores its original result and remains strict during recovery", async () => {
+  for (const mode of ["restore", "input", "output", "expired"]) {
+    const host = `latest-handoff-${mode}`;
+    const initial = [{ role: "user", content: "FAKE_MCP LATEST_HANDOFF" }];
+    const first = await (await send(host, initial)).json();
+    const call = first.content.find((p: any) => p.type === "tool_use");
+    const completed = await (await send(host, [...initial, { role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "DURABLE_RESULT_ONCE")] }])).json();
+    expect(completed.stop_reason).toBe("end_turn");
+    const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+    const before = (await sessionStore.toolCall(key, call.id))!;
+    expect(before.delivery).toBe("locally-handed-off");
+    await closeHostBridges(host);
+    const messages: any[] = [...initial, { role: "assistant", content: structuredClone(first.content) }];
+    if (mode === "input") messages[1].content.find((p: any) => p.id === call.id).input = { changed: true };
+    if (mode === "output") messages.push({ role: "user", content: [result(call.id, "CONFLICTING_RESULT")] });
+    if (mode === "expired") await sessionStore.saveToolCall(key, call.id, { ...before, result: undefined, payloadExpired: true });
+    const count = await promptLines();
+    const response = await send(host, messages);
+    const body = await response.json();
+    if (mode === "restore") {
+      expect(response.status).toBe(200);
+      expect(body.stop_reason).toBe("end_turn");
+      expect(body.content.some((p: any) => p.type === "tool_use")).toBe(false);
+      const logged = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!;
+      expect(logged).toContain("DURABLE_RESULT_ONCE");
+      expect(await promptLines()).toBe(count + 1);
+      expect(await sessionStore.toolCall(key, call.id)).toEqual(before);
+    } else {
+      expect(response.status).toBe(400);
+      expect(body.content).toBeUndefined();
+      expect(body.error.message).toMatch(mode === "expired" ? /payload expired/ : /conflict/i);
+      expect(await promptLines()).toBe(count);
+    }
+  }
+});
+
+test("earlier delivered history with omitted output is not restored past an assistant boundary", async () => {
+  const host = "earlier-handoff-omitted";
+  const initial = [{ role: "user", content: "FAKE_MCP EARLIER_HANDOFF" }];
+  const first = await (await send(host, initial)).json();
+  const call = first.content.find((p: any) => p.type === "tool_use");
+  await (await send(host, [...initial, { role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "DO_NOT_RESTORE_HISTORY_PAYLOAD")] }])).json();
+  const [key] = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
+  const before = await sessionStore.toolCall(key, call.id);
+  await closeHostBridges(host);
+  const messages = [...initial, { role: "assistant", content: [{ ...call, input: { summary: "shortened" } }] }, { role: "assistant", content: "Completed history boundary." }, { role: "user", content: "Continue without the old payload." }];
+  const response = await send(host, messages);
+  expect(response.status).toBe(200);
+  await response.json();
+  expect(await sessionStore.toolCall(key, call.id)).toEqual(before);
+  const logged = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!;
+  expect(logged).toContain("shortened");
+  expect(logged).not.toContain("DO_NOT_RESTORE_HISTORY_PAYLOAD");
+});
+
 test("plain proxy requests emit only configured instructions and user content", async () => {
   for (const system of ["Search only", ""]) {
     const response = await fetch(getProxyBaseUrl() + "/messages", {
@@ -163,6 +317,7 @@ test("MCP negotiates opted-in SSE progress and reports cancellation as a termina
 });
 
 test("parallel host calls park, partial results retain waiters without re-emission, then continue the same ACP prompt", async () => {
+  const before = await promptLines();
   const messages: any[] = [{ role: "user", content: "FAKE_MCP_PARALLEL" }];
   const first = await (await sendParallel("parallel", messages)).json();
   expect(first.stop_reason).toBe("tool_use"); expect(first.content).toHaveLength(2);
@@ -177,7 +332,7 @@ test("parallel host calls park, partial results retain waiters without re-emissi
   expect(final.stop_reason).toBe("end_turn");
   expect(JSON.stringify(final.content)).toContain("ONE"); expect(JSON.stringify(final.content)).toContain("DENIED");
   expect(JSON.stringify(final.content)).toContain("isError");
-  const prompts = (await readFile(join(directory, "prompts.jsonl"), "utf8")).split("\n").filter((line) => line.includes("FAKE_MCP_PARALLEL"));
+  const prompts = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").slice(before).filter((line) => line.includes("FAKE_MCP_PARALLEL"));
   expect(prompts).toHaveLength(1); expect(prompts[0]).toContain("HOST_INSTRUCTIONS_UNTRUNCATED");
 });
 
