@@ -38,7 +38,6 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ -z "$version" ] || [ -z "$source_dir" ] || fail 'Use either --version or --from-dir.'
-[ "$(id -u)" != 0 ] || fail 'Run as the account that will own the user service, without sudo.'
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || fail 'Requires Linux x86_64.'
 libc=$(getconf GNU_LIBC_VERSION 2>/dev/null) || fail 'Requires glibc 2.27 or newer.'
 case "$libc" in
@@ -110,6 +109,12 @@ account=$(id -un)
 if [ "$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)" != yes ]; then
     loginctl enable-linger "$account" ||
         fail "Could not enable boot startup. Ask an administrator to run: sudo loginctl enable-linger $account"
+fi
+if [ "$(id -u)" = 0 ]; then
+    # A root shell opened with sudo may have no root systemd user session.
+    systemctl start user@0.service || fail 'Could not start the root systemd user manager.'
+    export XDG_RUNTIME_DIR=/run/user/0
+    unset DBUS_SESSION_BUS_ADDRESS
 fi
 
 mkdir -p -- "$confdir" "$unitdir"

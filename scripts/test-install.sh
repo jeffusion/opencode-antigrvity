@@ -22,11 +22,24 @@ cat > "$scratch/mock/systemctl" <<'MOCK'
 #!/bin/sh
 set -eu
 case "$*" in
-    '--user daemon-reload'|'--user enable agy-api.service'|'--user start agy-api.service'|'--user restart agy-api.service') ;;
+    'start user@0.service') [ "$MOCK_UID" = 0 ] || exit 2 ;;
+    '--user daemon-reload'|'--user enable agy-api.service'|'--user start agy-api.service'|'--user restart agy-api.service')
+        if [ "$MOCK_UID" = 0 ]; then
+            [ "${XDG_RUNTIME_DIR:-}" = /run/user/0 ] && [ -z "${DBUS_SESSION_BUS_ADDRESS+x}" ] || exit 2
+        fi
+        ;;
     *) exit 2 ;;
 esac
 printf 'systemctl %s\n' "$*" >> "$TEST_LOG"
 [ "$MOCK_RELOAD_FAIL" = 0 ] || [ "$*" != '--user daemon-reload' ]
+MOCK
+cat > "$scratch/mock/id" <<'MOCK'
+#!/bin/sh
+case "$*" in
+    '-u') printf '%s\n' "$MOCK_UID" ;;
+    '-un') [ "$MOCK_UID" != 0 ] && exec /usr/bin/id -un; printf '%s\n' root ;;
+    *) exit 2 ;;
+esac
 MOCK
 cat > "$scratch/mock/getconf" <<'MOCK'
 #!/bin/sh
@@ -65,6 +78,8 @@ run_install() {
     : > "$log"
     env -i HOME="$test_home" XDG_CONFIG_HOME="$test_config" XDG_DATA_HOME="$test_data" \
         TMPDIR="$scratch" PATH="$scratch/mock:/usr/bin:/bin" TEST_LOG="$log" TEST_RELEASE="$release" \
+        MOCK_UID="${MOCK_UID:-1000}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
         MOCK_CURL_FAIL="${MOCK_CURL_FAIL:-0}" MOCK_LINGER_FAIL="${MOCK_LINGER_FAIL:-0}" \
         MOCK_LINGER_STATE="${MOCK_LINGER_STATE:-no}" \
         MOCK_RELOAD_FAIL="${MOCK_RELOAD_FAIL:-0}" MOCK_OLD_GLIBC="${MOCK_OLD_GLIBC:-0}" \
@@ -179,5 +194,21 @@ expect_failure 'Expected one SHA-256 checksum' --from-dir "$scratch/bad"
 cat "$release/$asset.sha256" "$release/$asset.sha256" > "$scratch/bad/$asset.sha256"
 expect_failure 'Expected one SHA-256 checksum' --from-dir "$scratch/bad"
 [ ! -s "$log" ]
+
+test_home=$scratch/root
+test_config=$test_home/.config
+test_data=$test_home/.local/share
+MOCK_UID=0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+    run_install --from-dir "$release" || { cat "$output" >&2; exit 1; }
+cmp -- "$release/$asset" "$test_home/.local/bin/agy-api"
+test -f "$test_config/systemd/user/agy-api.service"
+diff -u - "$log" <<LOG
+loginctl show-user root -p Linger --value
+loginctl enable-linger root
+systemctl start user@0.service
+systemctl --user daemon-reload
+systemctl --user enable agy-api.service
+systemctl --user start agy-api.service
+LOG
 
 printf '%s\n' 'Installer checks passed.'

@@ -104,7 +104,8 @@ GitHub Release with the binary and checksum after the Linux checks pass.
 
 On Linux x86_64 with glibc 2.27 or newer, download the
 [installer from main](https://raw.githubusercontent.com/jeffusion/opencode-antigrvity/main/scripts/install.sh)
-and run it as the account that will own the service:
+and run it as the account that will own the service. To install as root, run
+the installer from a root login shell (`sudo -i`):
 
 ```sh
 sh install.sh
@@ -119,6 +120,10 @@ administrator permission for boot startup, run
 `sudo loginctl enable-linger <account>` as an administrator, then retry the
 installer as the service account. Stop and disable the service with
 `systemctl --user disable --now agy-api.service`.
+
+For a root installation, the installer starts root's systemd user manager.
+In a root shell without a systemd user session, run `export XDG_RUNTIME_DIR=/run/user/0`
+before running the `systemctl --user` commands below.
 
 The API key and port are configured in
 `${XDG_CONFIG_HOME:-$HOME/.config}/agy-api/agy-api.env`. If the account uses a
