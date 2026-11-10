@@ -2,15 +2,15 @@
   "name": "@rasyid_rafi/opencode-antigravity",
   "version": "0.6.4",
   "packageManager": "bun@1.4.4",
-  "description": "OpenCode V2 provider adapter for Google's official Antigravity server via ACP",
+  "description": "Standalone LLM API and OpenCode V2 provider for Google Antigravity ACP",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rasyidrafi/opencode-antigrvity.git"
+    "url": "git+https://github.com/jeffusion/opencode-antigrvity.git"
   },
-  "homepage": "https://github.com/rasyidrafi/opencode-antigrvity#readme",
+  "homepage": "https://github.com/jeffusion/opencode-antigrvity#readme",
   "bugs": {
-    "url": "https://github.com/rasyidrafi/opencode-antigrvity/issues"
+    "url": "https://github.com/jeffusion/opencode-antigrvity/issues"
   },
   "type": "module",
   "main": "./src/index.ts",
@@ -38,6 +38,7 @@
   "scripts": {
     "precompile": "bun run scripts/clean.ts",
     "compile": "bun run --bun tsc -p tsconfig.json",
+    "build:service": "bun run scripts/build-service.ts",
     "pretest": "bun run compile",
     "test": "bun test test",
     "test:live": "OPENCODE_ANTIGRAVITY_ACP_LIVE=1 bun test test/acp-live.test.ts",

@@ -94,13 +94,14 @@ export async function detectAcpServer(preferred?: string): Promise<AcpServerDete
   return { executable, args: acpServerArgs(), platform: `${process.platform}-${process.arch}` };
 }
 
-export async function ensureAcpServer(preferred?: string): Promise<AcpServerDetection> {
+export async function ensureAcpServer(preferred?: string, signal?: AbortSignal): Promise<AcpServerDetection> {
+  signal?.throwIfAborted();
   try {
     return await detectAcpServer(preferred);
   } catch (error) {
     // Never silently ignore a user's explicit override.
     if (preferred?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_PATH?.trim()) throw error;
-    const executable = await installAcpServer();
+    const executable = await installAcpServer(undefined, undefined, signal);
     return { executable, args: acpServerArgs(), platform: `${process.platform}-${process.arch}` };
   }
 }

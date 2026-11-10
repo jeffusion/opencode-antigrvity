@@ -1,9 +1,10 @@
-name: Native ACP compatibility
+name: Native ACP compatibility and Linux service
 
 on:
   pull_request:
   push:
     branches: [main, pr2-integration, fix/windows-acp-compatibility]
+    tags: ['agy-api-v*']
   workflow_dispatch:
 
 permissions:
@@ -11,7 +12,7 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -21,7 +22,77 @@ jobs:
       - run: mkdir -p /tmp/opencode
       - run: bun ci
       - run: bun run check
+      - run: bun run build:service
+      - name: Verify standalone service and installer
+        run: |
+          release_dir="$RUNNER_TEMP/agy-api-release"
+          mkdir "$release_dir"
+          cp dist/agy-api "$release_dir/agy-api-linux-x86_64"
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            env -i PATH=/nonexistent HOME="$smoke_dir" "$release_dir/agy-api-linux-x86_64" --help
+            status=0
+            timeout 15s env -i PATH=/nonexistent HOME="$smoke_dir" AGY_PORT=0 \
+              AGY_API_KEY=smoke-test-key-at-least-32-characters \
+              OPENCODE_ANTIGRAVITY_ACP_PATH="$smoke_dir/missing-acp" \
+              "$release_dir/agy-api-linux-x86_64" > startup.log 2>&1 || status=$?
+            cat startup.log
+            test "$status" -eq 1
+            grep -Fq 'agy-api could not prepare ACP' startup.log
+          )
+          (
+            cd "$release_dir"
+            sha256sum agy-api-linux-x86_64 > agy-api-linux-x86_64.sha256
+          )
+          sh scripts/test-install.sh "$release_dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agy-api-linux-x86_64
+          path: |
+            ${{ runner.temp }}/agy-api-release/agy-api-linux-x86_64
+            ${{ runner.temp }}/agy-api-release/agy-api-linux-x86_64.sha256
+          if-no-files-found: error
+          overwrite: true
+  release:
+    if: >-
+      github.repository == 'jeffusion/opencode-antigrvity' &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      startsWith(github.ref_name, 'agy-api-v') && !github.event.deleted
+    needs: linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: agy-api-release-${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: agy-api-linux-x86_64
+          path: ${{ runner.temp }}/agy-api-release
+      - name: Verify downloaded checksum
+        working-directory: ${{ runner.temp }}/agy-api-release
+        run: sha256sum --check agy-api-linux-x86_64.sha256
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^agy-api-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected an installer-compatible release tag like agy-api-v1.2.3."
+            exit 1
+          fi
+          # Creation fails if this tag already has a published release.
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            "$RUNNER_TEMP/agy-api-release/agy-api-linux-x86_64" \
+            "$RUNNER_TEMP/agy-api-release/agy-api-linux-x86_64.sha256" \
+            scripts/install.sh
   macos:
+    if: github.event_name != 'push' || github.ref_type != 'tag'
     # actions/runner-images lists macos-15 as ARM64; assert architecture in test.
     runs-on: macos-15
     timeout-minutes: 15
@@ -47,6 +118,7 @@ jobs:
       # portable native-lock, tombstone, atomic-write and deletion-queue cases.
       - run: bun test test/macos-support.test.ts test/windows-support.test.ts test/file-lock.test.ts test/acp-install.test.ts test/atomic-write.test.ts test/deletion-recovery.test.ts test/bounded-retry-queue.test.ts test/cli-credentials.test.ts test/auth-bridge.test.ts test/host-environment.test.ts test/acp-process.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts test/usage-fallback.test.ts --timeout 30000
   windows:
+    if: github.event_name != 'push' || github.ref_type != 'tag'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:

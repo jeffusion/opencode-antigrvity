@@ -1,5 +1,5 @@
 import type { PromptResponse, SessionUpdate } from "@agentclientprotocol/sdk";
-import { AgyProcessError } from "./errors.js";
+import { AgyProcessError, type AgyError } from "./errors.js";
 
 // shortcut: CLI text errors are indistinguishable from identical model output; remove when upstream supplies structured errors.
 const harnessFailureHeader = "Agent execution error: Harness process exited unexpectedly (WS close code 1011).\nHarness stderr:\n";
@@ -13,8 +13,14 @@ export class HarnessFailureGuard {
   private held: AcpEvent[] = [];
   private passthrough = false;
 
+  constructor(private readonly exactFailure?: { text: string; error: () => AgyError }) {}
+
   push(event: AcpEvent): AcpEvent[] {
     if (event.event !== "update" || event.update.sessionUpdate !== "agent_message_chunk" || event.update.content.type !== "text") {
+      if (this.exactFailure && this.prefix === this.exactFailure.text &&
+          (event.event !== "result" || event.result.stopReason === "end_turn")) {
+        throw this.exactFailure.error();
+      }
       const output = this.flush();
       this.passthrough = false;
       return [...output, event];
@@ -23,11 +29,14 @@ export class HarnessFailureGuard {
     if (this.passthrough) return [event];
     // Empty chunks carry no text and must not grow the prefix queue.
     if (!text) return [];
+    const signature = this.exactFailure?.text ?? harnessFailureHeader;
+    // One extra character distinguishes a complete error from longer model output.
+    const limit = signature.length + (this.exactFailure ? 1 : 0);
     const previousPrefix = this.prefix;
-    this.prefix += text.slice(0, harnessFailureHeader.length - this.prefix.length);
+    this.prefix += text.slice(0, limit - this.prefix.length);
     this.held.push(event);
-    if (isHarnessFailure(this.prefix)) throw new AgyProcessError(previousPrefix + text);
-    if (harnessFailureHeader.startsWith(this.prefix)) return [];
+    if (!this.exactFailure && isHarnessFailure(this.prefix)) throw new AgyProcessError(previousPrefix + text);
+    if (signature.startsWith(this.prefix)) return [];
     this.passthrough = true;
     return this.flush();
   }

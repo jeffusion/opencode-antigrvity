@@ -298,7 +298,7 @@ async function clearProvenDeadLegacyChain(path: string): Promise<void> {
 
 /** Acquire a crash-released OS lock. Lock files live outside caller-owned,
  * removable utility directories and are deliberately never unlinked. */
-export async function acquireFileLock(path: string, waitMs = 0): Promise<NativeRelease> {
+export async function acquireFileLock(path: string, waitMs = 0, signal?: AbortSignal): Promise<NativeRelease> {
   // Retain the old API's directory-creation behavior for callers such as the
   // session store, while keeping the actual guard in the stable account-home
   // namespace below.
@@ -308,6 +308,7 @@ export async function acquireFileLock(path: string, waitMs = 0): Promise<NativeR
   await mkdir(dirname(nativePath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + Math.max(0, Number.isFinite(waitMs) ? waitMs : 0);
   while (true) {
+    signal?.throwIfAborted();
     const release = await backend.tryLock(nativePath);
     if (release) {
       try {

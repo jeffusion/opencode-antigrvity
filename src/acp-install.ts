@@ -37,7 +37,8 @@ export function unpackAcpArchive(bytes: Uint8Array, names: string[]): Record<str
 }
 
 /** Lazy first-request installation; shared across sessions and server processes. */
-export async function installAcpServer(directory = acpInstallDirectory(), download: typeof fetch = fetch): Promise<string> {
+export async function installAcpServer(directory = acpInstallDirectory(), download: typeof fetch = fetch, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const distribution = acpDistribution();
   const executable = join(directory, distribution.executable);
   const ready = async () => {
@@ -50,11 +51,12 @@ export async function installAcpServer(directory = acpInstallDirectory(), downlo
   };
   if (await ready()) return executable;
   await mkdir(directory, { recursive: true });
-  const release = await acquireFileLock(join(directory, ".install.lock"), 180_000);
+  const release = await acquireFileLock(join(directory, ".install.lock"), 180_000, signal);
   let staging: string | undefined;
   try {
     if (await ready()) return executable;
-    const response = await download(distribution.url, { signal: AbortSignal.timeout(120_000), redirect: "error" });
+    const timeout = AbortSignal.timeout(120_000);
+    const response = await download(distribution.url, { signal: signal ? AbortSignal.any([timeout, signal]) : timeout, redirect: "error" });
     if (!response.ok) throw new Error(`Official ACP download failed: HTTP ${response.status}`);
     const files = unpackAcpArchive(new Uint8Array(await response.arrayBuffer()), [distribution.executable, distribution.companion]);
     staging = await mkdtemp(join(directory, ".install-"));

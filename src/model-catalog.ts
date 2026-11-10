@@ -64,6 +64,7 @@ async function probe(context: CatalogContext, directory: string, signal: AbortSi
 }
 
 type Options = {
+  cache?: false;
   context?: () => Promise<CatalogContext>;
   probe?: typeof probe;
   onChange?: (catalog: AcpModelCatalog) => void;
@@ -91,9 +92,10 @@ export class ModelCatalog {
   }
 
   async start(): Promise<void> {
-    await this.refresh();
+    const force = this.options.cache === false;
+    await this.refresh(force);
     if (this.closed) return;
-    this.timer = setInterval(() => { void this.refresh(); }, 60_000);
+    this.timer = setInterval(() => { void this.refresh(force); }, 60_000);
     this.timer.unref?.();
   }
 
@@ -147,7 +149,7 @@ export class ModelCatalog {
       this.catalog.version !== catalog.version || this.catalog.source === "empty" && catalog.source !== "empty";
     this.catalog = catalog;
     if (changed) this.options.onChange?.(catalog);
-    if (!persist || !this.context) return;
+    if (!persist || !this.context || this.options.cache === false) return;
     const context = this.context;
     this.writes = this.writes.then(async () => {
       await mkdir(context.cacheDirectory, { recursive: true, mode: 0o700 });
@@ -165,6 +167,7 @@ export class ModelCatalog {
   }
 
   private async loadCache(context: CatalogContext): Promise<void> {
+    if (this.options.cache === false) return;
     const data = await jsonFile(join(context.cacheDirectory, `${context.scope}.json`));
     if (data.schema !== 1 || !Array.isArray(data.entries) || !Number.isFinite(data.discoveredAt) || data.discoveredAt > Date.now() ||
         !data.entries.every((entry: unknown) => Array.isArray(entry) && entry.length === 2 && entry.every((value) => typeof value === "string"))) return;

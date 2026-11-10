@@ -46,6 +46,7 @@ export type AcpWorkerOptions = {
   hostTools?: boolean;
   mcpServers?: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
   waitingForTools?: () => boolean;
+  maxUpdateBytes?: number;
 };
 
 type QueueWaiter<T> = {
@@ -234,6 +235,7 @@ export class AcpWorker {
   private stderrDiagnostic = "";
   private actualModelValue?: string;
   private executionActivity = false;
+  private turnUpdateBytes = 0;
   private authenticationFailure?: AgyError;
   private stderrTail = "";
 
@@ -396,6 +398,14 @@ export class AcpWorker {
   }
 
   private onSessionUpdate(params: SessionNotification): void {
+    if (params.sessionId === this.sessionIdValue && this.turnEvents && this.options.maxUpdateBytes !== undefined) {
+      this.turnUpdateBytes += Buffer.byteLength(JSON.stringify(params.update));
+      if (this.turnUpdateBytes > this.options.maxUpdateBytes) {
+        this.turnEvents.close(new AgyError("overload", "ACP output exceeded the service limit", { code: "agy_output_limit" }));
+        void this.stop(true).catch(() => undefined);
+        return;
+      }
+    }
     if (params.sessionId === this.sessionIdValue && params.update.sessionUpdate === "config_option_update") {
       this.recordModels(params.update);
     }
@@ -415,6 +425,7 @@ export class AcpWorker {
     if (signal?.aborted) throw new AgyAbortError();
     this.activeTurn = true;
     this.executionActivity = false;
+    this.turnUpdateBytes = 0;
     this.stateValue = "turn_active";
     this.turnEvents = new AsyncEventQueue<AcpEvent>();
     let result: PromptResponse | undefined;
