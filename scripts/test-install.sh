@@ -119,19 +119,21 @@ LOG
 sed -i 's/^AGY_PORT=.*/AGY_PORT=18787/' "$env_file"
 cp -- "$env_file" "$scratch/saved.env"
 chmod 0644 -- "$env_file"
-first_inode=$(stat -c %i "$bin")
-MOCK_LINGER_STATE=yes run_install --version agy-api-v1.2.3 --enable-linger || { cat "$output" >&2; exit 1; }
-[ "$(stat -c %i "$bin")" != "$first_inode" ]
-cmp -- "$scratch/saved.env" "$env_file"
-[ "$(stat -c %a "$env_file")" = 600 ]
-diff -u - "$log" <<LOG
-curl https://github.com/jeffusion/opencode-antigrvity/releases/download/agy-api-v1.2.3/$asset
-curl https://github.com/jeffusion/opencode-antigrvity/releases/download/agy-api-v1.2.3/$asset.sha256
+for version in v0.1.0 agy-api-v1.2.3; do
+    first_inode=$(stat -c %i "$bin")
+    MOCK_LINGER_STATE=yes run_install --version "$version" --enable-linger || { cat "$output" >&2; exit 1; }
+    [ "$(stat -c %i "$bin")" != "$first_inode" ]
+    cmp -- "$scratch/saved.env" "$env_file"
+    [ "$(stat -c %a "$env_file")" = 600 ]
+    diff -u - "$log" <<LOG
+curl https://github.com/jeffusion/opencode-antigrvity/releases/download/$version/$asset
+curl https://github.com/jeffusion/opencode-antigrvity/releases/download/$version/$asset.sha256
 loginctl show-user $(id -un) -p Linger --value
 systemctl --user daemon-reload
 systemctl --user enable agy-api.service
 systemctl --user restart agy-api.service
 LOG
+done
 
 bin_inode=$(stat -c %i "$bin")
 MOCK_LINGER_FAIL=1 expect_failure 'Ask an administrator to run: sudo loginctl enable-linger'

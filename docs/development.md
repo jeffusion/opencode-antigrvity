@@ -97,7 +97,7 @@ compatibility testing.
 
 The fork's Linux CI job builds the executable and uploads
 `agy-api-linux-x86_64` and `agy-api-linux-x86_64.sha256` as an Actions
-artifact. A push of a tag such as `agy-api-v1.0.0` to the fork creates a
+artifact. A push of a tag such as `v0.1.0` to the fork creates a
 GitHub Release with the binary and checksum after the Linux checks pass.
 
 ### Install with systemd
@@ -111,7 +111,7 @@ sh install.sh
 ```
 
 The installer uses the latest GitHub Release by default. Use
-`--version agy-api-v1.0.0` to pin a published binary and checksum, or
+`--version v0.1.0` to pin a published binary and checksum, or
 `--from-dir DIR` to install from local copies of those two files.
 The installer starts `agy-api.service`, enables boot startup even without an
 interactive login, and restarts the service on upgrades. If systemd requires

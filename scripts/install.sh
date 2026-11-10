@@ -8,7 +8,7 @@ fail() {
 }
 
 usage() {
-    printf '%s\n' 'Usage: install.sh [--version agy-api-vX.Y.Z | --from-dir DIR]' \
+    printf '%s\n' 'Usage: install.sh [--version vX.Y.Z | --from-dir DIR]' \
         'Installs and starts agy-api, with automatic startup at boot.'
 }
 
@@ -19,10 +19,10 @@ while [ "$#" -gt 0 ]; do
         --version)
             [ "$#" -ge 2 ] || fail 'Missing release tag after --version.'
             case "$2" in
-                *[!a-z0-9.-]*) fail 'Expected a release tag like agy-api-v1.2.3.' ;;
+                *[!a-z0-9.-]*) fail 'Expected a release tag like v0.1.0.' ;;
             esac
-            printf '%s\n' "$2" | grep -Eq '^agy-api-v[0-9]+\.[0-9]+\.[0-9]+$' ||
-                fail 'Expected a release tag like agy-api-v1.2.3.'
+            printf '%s\n' "$2" | grep -Eq '^(agy-api-)?v[0-9]+\.[0-9]+\.[0-9]+$' ||
+                fail 'Expected a release tag like v0.1.0.'
             version=$2
             shift
             ;;
