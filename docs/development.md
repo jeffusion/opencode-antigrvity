@@ -115,17 +115,27 @@ The installer uses the latest GitHub Release by default. Use
 `--version v0.1.0` to pin a published binary and checksum, or
 `--from-dir DIR` to install from local copies of those two files.
 The installer starts `agy-api.service`, enables boot startup even without an
-interactive login, and restarts the service on upgrades. If systemd requires
-administrator permission for boot startup, run
-`sudo loginctl enable-linger <account>` as an administrator, then retry the
-installer as the service account. Stop and disable the service with
-`systemctl --user disable --now agy-api.service`.
+interactive login, and restarts the service on upgrades. Root installs create
+`/etc/systemd/system/agy-api.service` and require root's login home and the
+default XDG config and data paths. If the previous installer created a root
+user service at `$HOME/.config/systemd/user/agy-api.service`, the installer
+stops and disables it before starting the system service. It saves the old
+unit as `agy-api.service.migrated` once the system service is registered and
+started.
 
-For a root installation, the installer starts root's systemd user manager.
-In a root shell without a systemd user session, run `export XDG_RUNTIME_DIR=/run/user/0`
-before running the `systemctl --user` commands below.
+Unprivileged installs use a systemd user service with lingering enabled. If
+systemd requires administrator permission for lingering, ask an administrator
+to run `sudo loginctl enable-linger <account>`, then retry the installer as the
+service account.
 
-The API key and port are configured in
+| Action | Root install | Unprivileged install |
+| --- | --- | --- |
+| Check status | `systemctl status agy-api.service` | `systemctl --user status agy-api.service` |
+| Restart | `systemctl restart agy-api.service` | `systemctl --user restart agy-api.service` |
+| Stop and disable at boot | `systemctl disable --now agy-api.service` | `systemctl --user disable --now agy-api.service` |
+| View logs | `journalctl -u agy-api.service` | `journalctl --user -u agy-api.service` |
+
+The API key, listen address (`AGY_HOST`) and port (`AGY_PORT`) are configured in
 `${XDG_CONFIG_HOME:-$HOME/.config}/agy-api/agy-api.env`. If the account uses a
 custom XDG config directory, the systemd user manager must use the same path.
 The installer preserves the existing environment file during upgrades.
@@ -139,13 +149,11 @@ profile="${XDG_DATA_HOME:-$HOME/.local/share}/agy-api/credentials"
 install -d -m 700 "$profile/antigravity-cli"
 install -m 600 "${GEMINI_HOME:-$HOME/.gemini}/antigravity-cli/antigravity-oauth-token" \
   "$profile/antigravity-cli/antigravity-oauth-token"
-systemctl --user restart agy-api.service
-systemctl --user status agy-api.service
-curl --fail http://127.0.0.1:8787/readyz
 ```
 
-Use `journalctl --user -u agy-api.service` for logs. If ACP installation fails
-at boot, the service exits and systemd retries after ten seconds.
+Restart the service using the command for your installation above, then run
+`curl --fail http://127.0.0.1:8787/readyz`. If ACP installation fails at boot,
+the service exits and systemd retries after ten seconds.
 
 ### Build and run directly
 
@@ -163,9 +171,10 @@ or downloads the official ACP executable and its companion. Set
 `OPENCODE_ANTIGRAVITY_ACP_PATH` to use an existing compatible installation.
 
 Set `AGY_API_KEY` to a random secret of at least 32 bytes before starting.
-`AGY_PORT` defaults to 8787 on 127.0.0.1. Put a TLS reverse proxy in front for
-remote access and disable response buffering on the SSE route. Use a dedicated
-OS account in a shared environment. `AGY_DATA_DIR` defaults to the XDG data
+`AGY_HOST` defaults to `127.0.0.1` and `AGY_PORT` defaults to `8787`.
+Set `AGY_HOST` to a specific interface address to serve clients on that network.
+For TLS access, use a reverse proxy with response buffering disabled for SSE.
+Use a dedicated OS account in a shared environment. `AGY_DATA_DIR` defaults to the XDG data
 directory under `agy-api`, and the credential directory defaults to
 `AGY_DATA_DIR/credentials`.
 
@@ -173,26 +182,79 @@ directory under `agy-api`, and the credential directory defaults to
   online ACP discovery reports at least one model.
 - `GET /v1/models` returns a model list under `data`.
 - `POST /v1/messages` accepts Anthropic-style `model`, `max_tokens`, `messages`,
-  optional `system` and `stream`. Send `x-api-key` or a bearer token for both API
-  routes. Messages contain strings or text blocks. For multiple turns, submit
-  the conversation history ending with a user message. The service rebuilds
-  bounded history in a fresh ACP session per request.
+  optional `system` and `stream`. Send `x-api-key` or a bearer token for
+  Messages and Chat Completions. An image block uses `type: "image"` and a
+  `source` with `type: "base64"`, `media_type` and `data`. For a new turn,
+  send the conversation history ending with a user message. The service
+  rebuilds bounded history in a fresh ACP session.
+- Messages accepts client `tools` with `name`, `input_schema` and optional
+  `description`. A call returns a `tool_use` content block with `id`,
+  `name` and `input`, and `stop_reason: "tool_use"`. Append the assistant
+  content, then send a single user message containing one `tool_result` per
+  call before any user text or images. Match each `tool_use_id` to the
+  corresponding call. Results support text, inline images and `is_error`.
+  `tool_choice` supports `{"type":"auto"}` and `{"type":"none"}`.
+  [Claude tool call reference](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
 - `stream: true` returns SSE; otherwise the response is JSON. ACP owns its
   output token budget, so `max_tokens` is advisory. Zero usage counts can mean
   that ACP did not report usage.
 - `POST /v1/chat/completions` supports the OpenAI SDK with
   `base_url="http://127.0.0.1:8787/v1"` and `api_key` set to `AGY_API_KEY`.
-  Send a model ID from `client.models.list()` and text messages ending with a
-  user message. Leading system and developer messages become instructions.
-  The route supports one choice, JSON or SSE, and
+  Send a model ID from `client.models.list()` and messages ending with a
+  user message when starting a turn. Leading system and developer messages
+  become instructions. User messages can mix text with `image_url` parts
+  whose `url` is a `data:image/<format>;base64,...` string. Omit `detail`
+  or use `"auto"`. The route supports one choice, JSON or SSE, and
   `stream_options={"include_usage": True}` with `stream=True` in Python.
-  Either `max_completion_tokens` or `max_tokens` can supply an advisory budget.
-  The route rejects tools, media, sampling controls and structured output.
+  Either `max_completion_tokens` or `max_tokens` can supply an advisory
+  budget. Sampling controls and structured output are unsupported.
+- Chat Completions accepts `tools` with `type: "function"` and a
+  `function` definition. A call returns in `message.tool_calls` for JSON
+  or `delta.tool_calls` for SSE with JSON-encoded `function.arguments` and
+  `finish_reason: "tool_calls"`. Append the assistant message, then send
+  one `role: "tool"` message per call with the matching `tool_call_id` and
+  text content. `tool_choice` supports `"auto"` and `"none"`.
+  [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+- For both Messages and Chat Completions, the client runs the tools. Return
+  the entire result batch in one request, in any order, to the same
+  authenticated service instance, protocol and model within three minutes.
+  The original conversation can be omitted when the request begins with the
+  result batch. The live ACP turn keeps the tools declared at its start.
+  Each batch can be resumed once. Forced calls, strict schemas and
+  serial-only tool calling are unsupported.
 - `GET /v1beta/models` lists the same ACP catalog in Gemini format.
   `POST /v1beta/models/{model}:generateContent` returns Gemini JSON, and
   `POST /v1beta/models/{model}:streamGenerateContent?alt=sse` streams Gemini
   response chunks. In the Google Gen AI SDK, set the base URL to
   `http://127.0.0.1:8787` and the API key to `AGY_API_KEY`.
-  Both routes accept one text candidate, `systemInstruction`, and an
-  advisory `generationConfig.maxOutputTokens`. Usage is included when ACP
-  reports it.
+  Both routes accept text and `inlineData` image parts with `mimeType` and
+  base64 `data`. They return one candidate, accept `systemInstruction`
+  and an advisory `generationConfig.maxOutputTokens`, and include usage
+  when ACP reports it.
+- Both Gemini routes accept `tools: [{functionDeclarations: [...]}]`. A
+  declaration takes a name, optional description, and either `parameters`
+  (Gemini's OpenAPI schema) or `parametersJsonSchema` (JSON Schema). The
+  service exposes declarations to the isolated ACP worker and returns
+  `candidates[0].content.parts[].functionCall` with an ID, name and arguments.
+  The client executes each function and sends a follow-up to the same model
+  with one `functionResponse: {id, name, response}` part per call in the batch.
+  Use the returned IDs for parallel calls, and send results in any order.
+  A response is a JSON object. Include an `error` key for a failed tool.
+  Add nested `parts[].inlineData` for tool result images. A named image can be
+  referenced once in the response JSON with `{"$ref":"<displayName>"}`. ACP
+  receives the response JSON and the images in order as MCP content blocks,
+  with each display name beside its image.
+  The response parts can follow the original conversation or appear alone.
+  New user text and inline images can follow the entire result batch, including
+  in the same user message. The live ACP prompt receives that content in order
+  as a labeled subsequent user message at the end of the last MCP result.
+  They resume the live ACP turn on the same service instance for up to three
+  minutes. Each batch can be resumed once. The service clears pending calls
+  on expiry or shutdown. Function calling supports automatic selection and
+  `toolConfig.functionCallingConfig.mode: "NONE"` to disable calls when
+  starting a turn. A continuation cannot change to that mode.
+  [Gemini function calling reference](https://ai.google.dev/gemini-api/docs/generate-content/function-calling)
+- All three protocols accept inline PNG, JPEG, WebP and GIF in message
+  content. Each image can be up to 4 MiB decoded, with up to 8 MiB decoded
+  across the request and a 12 MiB JSON body limit. System instructions use
+  text. The service rejects URL and file references, audio, video and documents.

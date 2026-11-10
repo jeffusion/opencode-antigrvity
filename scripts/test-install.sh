@@ -22,12 +22,18 @@ cat > "$scratch/mock/systemctl" <<'MOCK'
 #!/bin/sh
 set -eu
 case "$*" in
-    'start user@0.service') [ "$MOCK_UID" = 0 ] || exit 2 ;;
-    '--user daemon-reload'|'--user enable agy-api.service'|'--user start agy-api.service'|'--user restart agy-api.service')
-        if [ "$MOCK_UID" = 0 ]; then
-            [ "${XDG_RUNTIME_DIR:-}" = /run/user/0 ] && [ -z "${DBUS_SESSION_BUS_ADDRESS+x}" ] || exit 2
-        fi
+    '--system start user@0.service'|'--system daemon-reload'|'--system enable agy-api.service'|'--system start agy-api.service'|'--system restart agy-api.service')
+        [ "$MOCK_UID" = 0 ] || exit 2 ;;
+    '--user disable --now agy-api.service')
+        [ "$MOCK_UID" = 0 ] && [ "${XDG_RUNTIME_DIR:-}" = /run/user/0 ] &&
+            [ -z "${DBUS_SESSION_BUS_ADDRESS+x}" ] || exit 2
+        printf 'systemctl %s\n' "$*" >> "$TEST_LOG"
+        [ "$MOCK_MIGRATION_FAIL" = 0 ] || exit 1
+        rm -f -- "$XDG_CONFIG_HOME/systemd/user/default.target.wants/agy-api.service"
+        exit 0
         ;;
+    '--user daemon-reload'|'--user enable agy-api.service'|'--user start agy-api.service'|'--user restart agy-api.service')
+        [ "$MOCK_UID" != 0 ] || exit 2 ;;
     *) exit 2 ;;
 esac
 printf 'systemctl %s\n' "$*" >> "$TEST_LOG"
@@ -40,6 +46,12 @@ case "$*" in
     '-un') [ "$MOCK_UID" != 0 ] && exec /usr/bin/id -un; printf '%s\n' root ;;
     *) exit 2 ;;
 esac
+MOCK
+cat > "$scratch/mock/getent" <<'MOCK'
+#!/bin/sh
+set -eu
+[ "$*" = 'passwd 0' ] && [ "$MOCK_UID" = 0 ]
+printf 'root:x:0:0:root:%s:/bin/sh\n' "$MOCK_ROOT_HOME"
 MOCK
 cat > "$scratch/mock/getconf" <<'MOCK'
 #!/bin/sh
@@ -82,6 +94,7 @@ run_install() {
         DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
         MOCK_CURL_FAIL="${MOCK_CURL_FAIL:-0}" MOCK_LINGER_FAIL="${MOCK_LINGER_FAIL:-0}" \
         MOCK_LINGER_STATE="${MOCK_LINGER_STATE:-no}" \
+        MOCK_MIGRATION_FAIL="${MOCK_MIGRATION_FAIL:-0}" MOCK_ROOT_HOME="$scratch/root" \
         MOCK_RELOAD_FAIL="${MOCK_RELOAD_FAIL:-0}" MOCK_OLD_GLIBC="${MOCK_OLD_GLIBC:-0}" \
         sh "$installer" "$@" > "$output" 2>&1
 }
@@ -195,20 +208,81 @@ cat "$release/$asset.sha256" "$release/$asset.sha256" > "$scratch/bad/$asset.sha
 expect_failure 'Expected one SHA-256 checksum' --from-dir "$scratch/bad"
 [ ! -s "$log" ]
 
+# Redirect the system unit directory in the test copy before exercising UID 0.
+sed "s|^    unitdir=/etc/systemd/system$|    unitdir=$scratch/systemd/system|" "$installer" > "$scratch/install.sh"
+installer=$scratch/install.sh
+grep -Fxq "    unitdir=$scratch/systemd/system" "$installer"
 test_home=$scratch/root
 test_config=$test_home/.config
 test_data=$test_home/.local/share
+bin=$test_home/.local/bin/agy-api
+env_file=$test_config/agy-api/agy-api.env
+system_unit=$scratch/systemd/system/agy-api.service
+legacy_unit=$test_config/systemd/user/agy-api.service
+
+MOCK_UID=0 run_install --from-dir "$release" || { cat "$output" >&2; exit 1; }
+cmp -- "$release/$asset" "$bin"
+[ "$(stat -c %a "$system_unit")" = 644 ]
+[ "$(stat -c %a "$env_file")" = 600 ]
+[ ! -e "$legacy_unit" ]
+grep -Fxq "ExecStart=$bin" "$system_unit"
+grep -Fxq "EnvironmentFile=$env_file" "$system_unit"
+grep -Fxq "Environment=HOME=$test_home" "$system_unit"
+grep -Fxq 'WantedBy=multi-user.target' "$system_unit"
+grep -Fxq "AGY_CREDENTIALS_DIR=\"$test_data/agy-api/credentials\"" "$env_file"
+diff -u - "$log" <<LOG
+systemctl --system daemon-reload
+systemctl --system enable agy-api.service
+systemctl --system start agy-api.service
+LOG
+
+if MOCK_UID=0 test_config="$scratch/custom root config" run_install --from-dir "$release"; then
+    printf '%s\n' 'Unexpected success with a custom root config path.' >&2
+    exit 1
+fi
+grep -Fq 'default XDG config and data paths' "$output"
+[ ! -s "$log" ]
+[ ! -e "$scratch/custom root config" ]
+
+rm -- "$system_unit"
+mkdir -p -- "${legacy_unit%/*}/default.target.wants" "$test_data/agy-api/credentials"
+cp -- "$unit_file" "$legacy_unit"
+legacy_link=${legacy_unit%/*}/default.target.wants/agy-api.service
+ln -s -- "$legacy_unit" "$legacy_link"
+printf '%s\n' 'Existing credentials' > "$test_data/agy-api/credentials/example"
+cp -- "$env_file" "$scratch/saved.env"
+bin_inode=$(stat -c %i "$bin")
+MOCK_UID=0 MOCK_MIGRATION_FAIL=1 expect_failure 'Could not stop and disable the old root user service.' --from-dir "$release"
+[ ! -e "$system_unit" ]
+[ -L "$legacy_link" ]
+cmp -- "$unit_file" "$legacy_unit"
+diff -u - "$log" <<LOG
+systemctl --system start user@0.service
+systemctl --user disable --now agy-api.service
+LOG
+unset bin_inode
+
 MOCK_UID=0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
     run_install --from-dir "$release" || { cat "$output" >&2; exit 1; }
-cmp -- "$release/$asset" "$test_home/.local/bin/agy-api"
-test -f "$test_config/systemd/user/agy-api.service"
+[ -f "$system_unit" ]
+[ ! -e "$legacy_unit" ] && [ ! -L "$legacy_link" ]
+cmp -- "$unit_file" "$legacy_unit.migrated"
+cmp -- "$scratch/saved.env" "$env_file"
+grep -Fxq 'Existing credentials' "$test_data/agy-api/credentials/example"
 diff -u - "$log" <<LOG
-loginctl show-user root -p Linger --value
-loginctl enable-linger root
-systemctl start user@0.service
-systemctl --user daemon-reload
-systemctl --user enable agy-api.service
-systemctl --user start agy-api.service
+systemctl --system start user@0.service
+systemctl --user disable --now agy-api.service
+systemctl --system daemon-reload
+systemctl --system enable agy-api.service
+systemctl --system restart agy-api.service
+LOG
+
+MOCK_UID=0 run_install --from-dir "$release" || { cat "$output" >&2; exit 1; }
+cmp -- "$scratch/saved.env" "$env_file"
+diff -u - "$log" <<LOG
+systemctl --system daemon-reload
+systemctl --system enable agy-api.service
+systemctl --system restart agy-api.service
 LOG
 
 printf '%s\n' 'Installer checks passed.'

@@ -97,8 +97,12 @@ async function handlePrompt(message) {
   if (text.includes("FAKE_MCP") && !text.includes("[tool result") && !text.includes("[host accepted terminal output")) {
     const url = mcpServers[0]?.url;
     if (!url) { fail(id, -32603, "Missing MCP bridge"); return; }
-    const rpc = async (method, params = {}) => (await (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: nextRequestId++, method, params }) })).json());
+    const signedZero = text.includes("FAKE_MCP_SIGNED_ZERO");
+    const rpc = async (method, params = {}) => {
+      const body = JSON.stringify({ jsonrpc: "2.0", id: nextRequestId++, method, params });
+      return (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: signedZero ? body.replace('"signedZero":0', '"signedZero":-0') : body })).json();
+    };
     const initialized = await rpc("initialize", { protocolVersion: "2025-03-26" });
     if (initialized.result?.serverInfo?.name !== mcpServers[0].name) { fail(id, -32603, "MCP server identity mismatch"); return; }
     if (text.includes("FAKE_MCP_PERMISSION")) {
@@ -114,14 +118,24 @@ async function handlePrompt(message) {
     }
     const list = await rpc("tools/list");
     const name = list.result.tools[0].name;
+    if (process.env.FAKE_ACP_MCP_LIST_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_LIST_LOG, JSON.stringify(list.result.tools) + "\n");
     if (text.includes("FAKE_MCP_USAGE_BEFORE")) update({ sessionUpdate: "usage_update", used: contextUsed(text), size: 1000 });
     if (text.includes("FAKE_MCP_ACTIVITY")) {
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "GENUINE_THOUGHT_BEFORE" } });
       update({ sessionUpdate: "tool_call", toolCallId: "activity-tool", title: "opencode_shell: duplicate-command", kind: "execute", status: "pending" });
       update({ sessionUpdate: "tool_call_update", toolCallId: "activity-tool", status: "in_progress" });
     }
+    if (text.includes("FAKE_MCP_PREAMBLE")) {
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "I will check." } });
+    }
+    if (text.includes("FAKE_MCP_QUEUED_TEXT")) {
+      for (const character of ["a", "b", "c"]) {
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: character.repeat(80_000) } });
+      }
+    }
     const count = text.includes("FAKE_MCP_PARALLEL") ? 2 : 1;
-    const results = await Promise.all(Array.from({ length: count }, (_, index) => rpc("tools/call", { name, arguments: { index } })));
+    const results = await Promise.all(Array.from({ length: count }, (_, index) =>
+      rpc("tools/call", { name, arguments: { index, ...(signedZero ? { signedZero: 0 } : {}) } })));
     if (process.env.FAKE_ACP_MCP_RESULT_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_RESULT_LOG, JSON.stringify(results) + "\n");
     if (text.includes("FAKE_MCP_HARNESS_FATAL")) {
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Agent execution error: Harness process exited unexpectedly (WS close code 1011).\nHarness stderr:\ncontext canceled" } });

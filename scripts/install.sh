@@ -49,7 +49,6 @@ awk -v version="$libc" 'BEGIN {
     exit !(parts[1] > 2 || (parts[1] == 2 && parts[2] >= 27))
 }' || fail 'Requires glibc 2.27 or newer.'
 command -v systemctl >/dev/null || fail 'Requires systemd and its systemctl command.'
-command -v loginctl >/dev/null || fail 'Requires systemd and its loginctl command.'
 
 asset=agy-api-linux-x86_64
 release=https://github.com/jeffusion/opencode-antigrvity/releases
@@ -66,6 +65,28 @@ confdir=$config_home/agy-api
 env_file=$confdir/agy-api.env
 unitdir=$config_home/systemd/user
 unit=agy-api.service
+scope=--user
+exec_path=%h/.local/bin/agy-api
+environment_path=%E/agy-api/agy-api.env
+target=default.target
+legacy_unit=
+if [ "$(id -u)" = 0 ]; then
+    root_home=$(getent passwd 0 | cut -d: -f6)
+    [ "$HOME" = "$root_home" ] && [ "$config_home" = "$HOME/.config" ] &&
+        [ "$data_home" = "$HOME/.local/share" ] ||
+        fail 'Root installs require a root login shell (sudo -i) and default XDG config and data paths.'
+    case "$HOME" in
+        *[!a-zA-Z0-9_./-]*) fail 'Unsupported characters in the root home path.' ;;
+    esac
+    legacy_unit=$unitdir/$unit
+    unitdir=/etc/systemd/system
+    scope=--system
+    exec_path=$bindir/agy-api
+    environment_path=$env_file
+    target=multi-user.target
+else
+    command -v loginctl >/dev/null || fail 'Requires systemd and its loginctl command.'
+fi
 
 umask 077
 mkdir -p -- "$bindir"
@@ -105,16 +126,12 @@ chmod 0755 -- "$stage/$asset"
 "$stage/$asset" --help > "$stage/help" && grep -Fxq 'Usage: agy-api' "$stage/help" ||
     fail 'The verified binary did not pass its --help check.'
 
-account=$(id -un)
-if [ "$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)" != yes ]; then
-    loginctl enable-linger "$account" ||
-        fail "Could not enable boot startup. Ask an administrator to run: sudo loginctl enable-linger $account"
-fi
-if [ "$(id -u)" = 0 ]; then
-    # A root shell opened with sudo may have no root systemd user session.
-    systemctl start user@0.service || fail 'Could not start the root systemd user manager.'
-    export XDG_RUNTIME_DIR=/run/user/0
-    unset DBUS_SESSION_BUS_ADDRESS
+if [ "$scope" = --user ]; then
+    account=$(id -un)
+    if [ "$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)" != yes ]; then
+        loginctl enable-linger "$account" ||
+            fail "Could not enable boot startup. Ask an administrator to run: sudo loginctl enable-linger $account"
+    fi
 fi
 
 mkdir -p -- "$confdir" "$unitdir"
@@ -135,14 +152,19 @@ fi
 chmod 0600 -- "$env_file"
 
 unit_stage=$(mktemp "$unitdir/.agy-api.XXXXXXXX")
-cat > "$unit_stage" <<'UNIT'
+cat > "$unit_stage" <<UNIT
 [Unit]
 Description=Antigravity API service
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/agy-api
-EnvironmentFile=%E/agy-api/agy-api.env
+ExecStart=$exec_path
+EnvironmentFile=$environment_path
+UNIT
+if [ "$scope" = --system ]; then
+    printf 'Environment=HOME=%s\n' "$HOME" >> "$unit_stage"
+fi
+cat >> "$unit_stage" <<UNIT
 Restart=on-failure
 RestartSec=10s
 KillMode=mixed
@@ -150,9 +172,17 @@ TimeoutStopSec=30s
 UMask=0077
 
 [Install]
-WantedBy=default.target
+WantedBy=$target
 UNIT
 chmod 0644 -- "$unit_stage"
+
+if [ -e "$legacy_unit" ] || [ -L "$legacy_unit" ]; then
+    systemctl --system start user@0.service && (
+        export XDG_RUNTIME_DIR=/run/user/0
+        unset DBUS_SESSION_BUS_ADDRESS
+        systemctl --user disable --now "$unit"
+    ) || fail 'Could not stop and disable the old root user service. Fix the root user service and retry.'
+fi
 mv -fT -- "$unit_stage" "$unitdir/$unit"
 
 action=start
@@ -161,6 +191,10 @@ if [ -e "$bindir/agy-api" ]; then
 fi
 mv -fT -- "$stage/$asset" "$bindir/agy-api"
 
-systemctl --user daemon-reload && systemctl --user enable "$unit" && systemctl --user "$action" "$unit" ||
-    fail "Installed at $bindir/agy-api, but systemd setup failed. Run: systemctl --user daemon-reload && systemctl --user enable $unit && systemctl --user restart $unit"
+systemctl "$scope" daemon-reload && systemctl "$scope" enable "$unit" && systemctl "$scope" "$action" "$unit" ||
+    fail "Installed at $bindir/agy-api, but systemd setup failed. Run: systemctl $scope daemon-reload && systemctl $scope enable $unit && systemctl $scope restart $unit"
+if [ -e "$legacy_unit" ] || [ -L "$legacy_unit" ]; then
+    mv -fT --backup=numbered -- "$legacy_unit" "$legacy_unit.migrated" ||
+        fail "The system service is installed and the old user service is disabled, but could not archive $legacy_unit."
+fi
 printf 'agy-api installed at %s\nEnvironment file: %s\n' "$bindir/agy-api" "$env_file"

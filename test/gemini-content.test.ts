@@ -29,7 +29,13 @@ test("Gemini requests map text, roles, system instructions and output budget", (
 
 test("Gemini requests reject unsupported and malformed input", () => {
   for (const fields of [
-    { tools: [] },
+    { tools: [{ googleSearch: {} }] },
+    { tools: [{ functionDeclarations: [{ name: "dup" }, { name: "dup" }] }] },
+    { tools: [{ functionDeclarations: [{ name: "mixed", parameters: {}, parametersJsonSchema: {} }] }] },
+    { toolConfig: { functionCallingConfig: { mode: "ANY" } } },
+    { contents: [{ parts: [{ functionResponse: { name: "f", response: {} } }] }] },
+    { contents: [{ parts: [{ text: "before results" }, { functionResponse: { id: "id", name: "f", response: {} } }] }] },
+    { contents: [{ parts: [{ functionResponse: { id: "id", name: "f", response: {} } }] }], toolConfig: { functionCallingConfig: { mode: "NONE" } } },
     { generationConfig: { temperature: 0 } },
     { generationConfig: { responseMimeType: "application/json" } },
     { generationConfig: { candidateCount: 2 } },
@@ -38,10 +44,54 @@ test("Gemini requests reject unsupported and malformed input", () => {
     { contents: [{ role: "model", parts: [{ text: "Question" }] }] },
     { contents: [{ parts: [{ text: "Question", thought: true }] }] },
     { contents: [{ parts: [] }] },
+    { contents: [{ parts: [{ fileData: { fileUri: "gs://bucket/image.png", mimeType: "image/png" } }] }] },
+    { contents: [{ parts: [{ inlineData: { data: "AAAA", mimeType: "audio/wav" } }] }] },
+    { contents: [{ parts: [{ inlineData: { data: "not base64", mimeType: "image/png" } }] }] },
+    { contents: [{ parts: [{ inlineData: { data: "AAAA", mimeType: "image/png", fileUri: "file:///image.png" } }] }] },
     { systemInstruction: { parts: [{ inlineData: { data: "AAAA", mimeType: "image/png" } }] } },
   ]) {
     expect(() => parseGeminiContent({ contents, ...fields }, model, false)).toThrow(AgyError);
   }
+});
+
+test("Gemini function result images validate references, encoding and request-wide media limits", () => {
+  const inlineData = { data: "AA==", mimeType: "image/png", displayName: "picture.png" };
+  const call = { id: "id", name: "render" };
+  const parse = (response: object, parts: object[], extra: object[] = []) => parseGeminiContent({
+    contents: [{ parts: [{ functionResponse: { ...call, response, parts } }, ...extra] }],
+  }, model, false);
+  for (const level of ["MEDIA_RESOLUTION_LOW", "MEDIA_RESOLUTION_HIGH"]) {
+    const image = { data: "AA==", mimeType: "image/png" };
+    expect(parse({}, [], [{ inlineData: image, mediaResolution: { level } }]).steering)
+      .toEqual([{ type: "image", ...image }]);
+  }
+  expect(() => parse({}, [], [{ inlineData, mediaResolution: { level: "invalid" } }])).toThrow("Unsupported image mediaResolution");
+  for (const [response, parts] of [
+    [{ output: { $ref: "missing.png" } }, [{ inlineData }]],
+    [{ output: [{ $ref: "picture.png" }, { $ref: "picture.png" }] }, [{ inlineData }]],
+    [{}, [{ inlineData }, { inlineData }]],
+    [{}, [{ fileData: { fileUri: "https://example.test/picture.png" } }]],
+    [{}, [{ inlineData: { ...inlineData, mimeType: "application/pdf" } }]],
+    [{}, [{ inlineData: { ...inlineData, data: "AB==" } }]],
+  ] as const) expect(() => parse(response, [...parts])).toThrow(AgyError);
+  const maximum = Buffer.alloc(4 * 1024 * 1024).toString("base64");
+  expect(() => parse({}, [{ inlineData: { ...inlineData, data: maximum } }], [
+    { inlineData: { data: maximum, mimeType: "image/png" } },
+    { inlineData: { data: "AA==", mimeType: "image/png" } },
+  ])).toThrow("The combined images are too large");
+});
+
+test("Gemini function declarations accept OpenAPI and raw JSON Schema", () => {
+  const tools = [{ functionDeclarations: [
+    { name: "native", parameters: { type: "OBJECT", properties: { arg: { type: "STRING", nullable: true } } } },
+    { name: "raw", description: "Raw schema", parametersJsonSchema: { type: "object", additionalProperties: false } },
+  ] }];
+  expect(parseGeminiContent({ contents, tools }, model, false).tools).toEqual([
+    { name: "native", input_schema: { type: "object", properties: { arg: { type: ["string", "null"] } } } },
+    { name: "raw", description: "Raw schema", input_schema: { type: "object", additionalProperties: false } },
+  ]);
+  expect(parseGeminiContent({ contents, tools, toolConfig: { functionCallingConfig: { mode: "NONE" } } }, model, false).tools).toBeUndefined();
+  expect(parseGeminiContent({ contents, tools: [] }, model, false).tools).toBeUndefined();
 });
 
 function text(value: string): AcpEvent {

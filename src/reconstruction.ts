@@ -3,10 +3,10 @@ import type { HostMessage } from "./prompt.js";
 import { blockBytes, blockBudget, FIXED_BUDGET_HEADROOM, HISTORY_OMISSION } from "./budget.js";
 import { MAX_MEDIA_BYTES, validateMediaBlocks } from "./attachments.js";
 
-export type ReconstructionGroup = { blocks: ContentBlock[]; operative: boolean; message: HostMessage };
+export type ReconstructionGroup = { blocks: ContentBlock[]; operative: boolean; message: HostMessage; toolIds?: string[] };
 
-function identities(message: HostMessage): string[] {
-  const ids: string[] = [];
+function identities({ message, toolIds }: ReconstructionGroup): string[] {
+  const ids = [...(toolIds ?? [])];
   if (typeof message.tool_call_id === "string") ids.push(message.tool_call_id);
   if (Array.isArray(message.tool_calls)) for (const call of message.tool_calls) if (typeof call?.id === "string") ids.push(call.id);
   if (Array.isArray(message.content)) for (const part of message.content) {
@@ -29,7 +29,7 @@ export function reconstruct(groups: ReconstructionGroup[], instructions: string,
   };
   const owner = new Map<string, number>();
   groups.forEach((group, i) => {
-    for (const id of identities(group.message)) {
+    for (const id of identities(group)) {
       const previous = owner.get(id);
       if (previous !== undefined) parents[find(i)] = find(previous);
       owner.set(id, i);

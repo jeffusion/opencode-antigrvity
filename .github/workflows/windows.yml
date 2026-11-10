@@ -32,14 +32,20 @@ jobs:
           (
             cd "$smoke_dir"
             env -i PATH=/nonexistent HOME="$smoke_dir" "$release_dir/agy-api-linux-x86_64" --help
-            status=0
-            timeout 15s env -i PATH=/nonexistent HOME="$smoke_dir" AGY_PORT=0 \
-              AGY_API_KEY=smoke-test-key-at-least-32-characters \
-              OPENCODE_ANTIGRAVITY_ACP_PATH="$smoke_dir/missing-acp" \
-              "$release_dir/agy-api-linux-x86_64" > startup.log 2>&1 || status=$?
-            cat startup.log
-            test "$status" -eq 1
-            grep -Fq 'agy-api could not prepare ACP' startup.log
+            check_bind() {
+              local expected_host=$1 status=0
+              shift
+              timeout 15s env -i PATH=/nonexistent HOME="$smoke_dir" AGY_PORT=0 \
+                AGY_API_KEY=smoke-test-key-at-least-32-characters \
+                OPENCODE_ANTIGRAVITY_ACP_PATH="$smoke_dir/missing-acp" "$@" \
+                "$release_dir/agy-api-linux-x86_64" > startup.log 2>&1 || status=$?
+              cat startup.log
+              test "$status" -eq 1
+              grep -Fq "agy-api listening on http://$expected_host:" startup.log
+              grep -Fq 'agy-api could not prepare ACP' startup.log
+            }
+            check_bind 127.0.0.1
+            check_bind 127.0.0.2 AGY_HOST=127.0.0.2
           )
           (
             cd "$release_dir"

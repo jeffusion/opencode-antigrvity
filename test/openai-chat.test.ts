@@ -28,13 +28,16 @@ test("Chat Completions normalizes leading instructions and text history for the 
 
 test("Chat Completions rejects unsupported controls and malformed nested input", () => {
   for (const overrides of [
-    { tools: [] }, { temperature: 1 }, { n: 2 }, { store: true }, { max_tokens: 10, max_completion_tokens: 10 },
+    { tools: [{ type: "custom" }] }, { tool_choice: "required" }, { parallel_tool_calls: false },
+    { tools: [{ type: "function", function: { name: "strict_tool", strict: true } }] },
+    { temperature: 1 }, { n: 2 }, { store: true }, { max_tokens: 10, max_completion_tokens: 10 },
     { max_completion_tokens: null }, { max_tokens: 0 }, { stream: "true" }, { stream_options: { include_usage: true } },
     { stream: true, stream_options: null }, { stream: true, stream_options: [] },
     { stream: true, stream_options: { include_usage: "true" } }, { stream: true, stream_options: { include_obfuscation: false } },
     { messages: [null, user] }, { messages: [user, { role: "developer", content: "late" }, user] },
     { messages: [{ role: "tool", content: "answer" }, user] }, { messages: [{ ...user, name: "alias" }] },
-    { messages: [{ ...user, content: [{ type: "image_url", image_url: { url: "example" } }] }] },
+    ...["https://example.com/a.png", "file:///private.png", "data:image/svg+xml;base64,AAAA", "data:image/png;base64,AB=="]
+      .map(url => ({ messages: [{ ...user, content: [{ type: "image_url", image_url: { url } }] }] })),
     { messages: [{ ...user, content: [{ type: "text", text: "question", extra: true }] }] },
     { messages: [{ ...user, content: [null] }] }, { messages: [{ ...user, content: ["question"] }] },
     { messages: [{ role: "assistant", content: "answer" }] },

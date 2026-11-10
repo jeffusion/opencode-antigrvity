@@ -26,9 +26,10 @@ curl -fsSL https://raw.githubusercontent.com/jeffusion/opencode-antigrvity/main/
 ```
 
 The installer verifies the binary from GitHub Releases, starts the service, and
-enables it at boot. To stop it and disable automatic startup, run
-`systemctl --user disable --now agy-api.service`. In a root shell without a
-systemd user session, prefix that command with `XDG_RUNTIME_DIR=/run/user/0`.
+enables it at boot. A root install registers a system service. Check it with
+`systemctl status agy-api.service` and stop it with
+`systemctl disable --now agy-api.service`. An unprivileged install registers a
+user service. Use `systemctl --user` for the same commands.
 
 The service listens on `127.0.0.1:8787` by default. Provision an `agy` login in
 its dedicated credential directory before sending inference requests.

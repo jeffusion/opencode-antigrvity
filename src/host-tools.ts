@@ -11,6 +11,7 @@ import { freezeContextOccupancy } from "./telemetry.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { MAX_MEDIA_BYTES, validateMediaBlocks } from "./attachments.js";
 import { blockBudget } from "./budget.js";
+import { acceptsMcpSse, mcpProgressResponse as progressResponse, readMcpBody } from "./mcp-http.js";
 
 export type HostTool = { name: string; description?: string; input_schema: Record<string, unknown> };
 export type HostCall = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -96,44 +97,10 @@ async function locallyHandedOff(result: unknown): Promise<void> {
   if (identity) await sessionStore.toolDelivery(identity.key, identity.id, "locally-handed-off");
 }
 
-/** MCP progress is opt-in via progressToken and a negotiated SSE response.
- * A waiting notification reports zero completed work; comments are transport
- * keepalive, never fabricated increasing work progress or successful results. */
-export function mcpProgressResponse(id: unknown, progressToken: string | number, result: Promise<unknown>, cancel: () => void, intervalMs = 15_000): Response {
-  const encoder = new TextEncoder();
-  let timer: ReturnType<typeof setInterval> | undefined;
-  let closed = false;
-  return new Response(new ReadableStream<Uint8Array>({
-    start(controller) {
-      const send = (payload: unknown) => controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(payload)}\n\n`));
-      send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: 0, message: "Waiting for OpenCode tool execution" } });
-      timer = setInterval(() => { if (!closed) controller.enqueue(encoder.encode(": keepalive\n\n")); }, intervalMs);
-      timer.unref?.();
-      const finish = (payload: unknown) => { clearInterval(timer); if (closed) return false; send(payload); controller.close(); closed = true; return true; };
-      void result.then(async value => { if (finish({ jsonrpc: "2.0", id, result: value })) await locallyHandedOff(value); }, error => finish({ jsonrpc: "2.0", id, error: { code: -32603, message: error instanceof Error ? error.message : "MCP request failed" } })).catch(() => { /* Durable intent remains; no remote acknowledgement is inferred. */ });
-    },
-    cancel() { closed = true; clearInterval(timer); cancel(); },
-  }), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
-}
+export { readMcpBody } from "./mcp-http.js";
 
-export async function readMcpBody(request: Request, max = 8 * 1024 * 1024, deadlineMs = 15_000): Promise<string> {
-  const reader = request.body?.getReader();
-  if (!reader) return "";
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => {
-    reject(new AgyError("timeout", "MCP body read deadline exceeded")); void reader.cancel().catch(() => {});
-  }, deadlineMs); });
-  try {
-    const chunks: Uint8Array[] = []; let bytes = 0;
-    while (true) {
-      const next = await Promise.race([reader.read(), timeout]);
-      if (next.done) break;
-      bytes += next.value.byteLength;
-      if (bytes > max) throw new AgyError("invalid_request", "MCP request too large");
-      chunks.push(next.value);
-    }
-    return Buffer.concat(chunks).toString("utf8");
-  } finally { clearTimeout(timer); void reader.cancel().catch(() => {}); }
+export function mcpProgressResponse(id: unknown, progressToken: string | number, result: Promise<unknown>, cancel: () => void, intervalMs?: number): Response {
+  return progressResponse(id, progressToken, result, cancel, intervalMs, "Waiting for OpenCode tool execution", locallyHandedOff);
 }
 
 function profile(tools: HostTool[], settings: SessionSettings): string {
@@ -498,8 +465,7 @@ export async function handleHostMcp(request: Request): Promise<Response> {
       mcpRequests.set(key, () => { rejectCancel(new AgyAbortError()); void bridge.close(); });
       const running = Promise.race([bridge.call(rpc.params?.name, rpc.params?.arguments ?? {}), cancelled]).finally(() => { mcpRequests.delete(key); });
       const progressToken = rpc.params?._meta?.progressToken;
-      const acceptsSse = request.headers.get("accept")?.split(",").some(value => value.trim().split(";")[0] === "text/event-stream" && !/;\s*q=0(?:\.0*)?(?:\s*;|\s*$)/i.test(value));
-      if ((typeof progressToken === "string" || typeof progressToken === "number") && acceptsSse) return mcpProgressResponse(id, progressToken, running, () => mcpRequests.get(key)?.());
+      if ((typeof progressToken === "string" || typeof progressToken === "number") && acceptsMcpSse(request)) return mcpProgressResponse(id, progressToken, running, () => mcpRequests.get(key)?.());
       result = await running;
     }
     else return Response.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });

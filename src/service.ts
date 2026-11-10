@@ -11,8 +11,10 @@ import { ModelCatalog } from "./model-catalog.js";
 import { resolveAcpModelSelection } from "./models.js";
 import { openAIErrorResponse, openAIJson, openAIStream, parseChatCompletion } from "./openai-chat.js";
 import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn } from "./service-messages.js";
+import { ClientToolTurn, type ToolProtocol } from "./tool-turn.js";
 
-const MAX_REQUEST_BYTES = 256 * 1024;
+// 8 MiB of images expands to about 10.7 MiB in base64.
+const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_IN_FLIGHT = 4;
 const REQUEST_TIMEOUT_MS = 180_000;
 const DRAIN_MS = 5_000;
@@ -41,14 +43,16 @@ async function main(): Promise<void> {
   if (process.argv.includes("--help")) {
     console.log(`Usage: agy-api
   AGY_API_KEY          Required API key (at least 32 bytes)
-  AGY_PORT             Loopback port (default 8787)
+  AGY_HOST             Listen address (default 127.0.0.1)
+  AGY_PORT             Listen port (default 8787)
   AGY_DATA_DIR         Private state directory (default ~/.local/share/agy-api)
   AGY_CREDENTIALS_DIR  agy CLI login directory (default AGY_DATA_DIR/credentials)
 
 GET /healthz, GET /readyz, GET /v1/models, POST /v1/messages, POST /v1/chat/completions
 GET /v1beta/models, POST /v1beta/models/{model}:generateContent or :streamGenerateContent
 Authenticate with x-api-key or Authorization: Bearer. Gemini routes also accept x-goog-api-key.
-Use a TLS reverse proxy for remote access. Inference accepts text only. Output token budgets are advisory.`);
+Use a TLS reverse proxy for remote access. All three generation protocols accept inline images
+and client-side function calling. Output token budgets are advisory.`);
     return;
   }
 
@@ -56,6 +60,7 @@ Use a TLS reverse proxy for remote access. Inference accepts text only. Output t
   if (!key || Buffer.byteLength(key) < 32 || /\s/.test(key)) throw new Error("Set AGY_API_KEY to a secret of at least 32 bytes without whitespace");
   const keyHash = digest(key);
   delete process.env.AGY_API_KEY;
+  const hostname = process.env.AGY_HOST?.trim() || "127.0.0.1";
   const port = Number(process.env.AGY_PORT ?? 8787);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("AGY_PORT must be a valid TCP port");
 
@@ -68,16 +73,18 @@ Use a TLS reverse proxy for remote access. Inference accepts text only. Output t
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = data;
   const release = await acquireFileLock(join(data, ".service.lock"));
   try {
-    await serve(directory, port, keyHash);
+    await serve(directory, hostname, port, keyHash);
   } finally {
     await release();
   }
 }
 
-async function serve(directory: string, port: number, keyHash: Buffer): Promise<void> {
+async function serve(directory: string, hostname: string, port: number, keyHash: Buffer): Promise<void> {
   const stop = new AbortController();
   const finished = Promise.withResolvers<void>();
   const active = new Set<Promise<void>>();
+  const toolTurns = new Set<ClientToolTurn>();
+  let workers = 0;
   let draining = false;
   let discovery: Promise<void> | undefined;
   let detection: Awaited<ReturnType<typeof ensureAcpServer>> | undefined;
@@ -85,7 +92,7 @@ async function serve(directory: string, port: number, keyHash: Buffer): Promise<
   const ready = () => !draining && detection && catalog.catalog.source === "acp" && catalog.catalog.models.length > 0 && !catalog.lastError;
 
   const server = Bun.serve({
-    hostname: "127.0.0.1", port, idleTimeout: 0, maxRequestBodySize: MAX_REQUEST_BYTES,
+    hostname, port, idleTimeout: 0, maxRequestBodySize: MAX_REQUEST_BYTES,
     async fetch(request) {
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/healthz") return Response.json({ ok: true });
@@ -116,7 +123,12 @@ async function serve(directory: string, port: number, keyHash: Buffer): Promise<
       if (active.size >= MAX_IN_FLIGHT) return fail(new AgyError("overload", "The service is at its concurrency limit"));
 
       const done = Promise.withResolvers<void>();
-      const settled = () => { active.delete(done.promise); done.resolve(); };
+      let plainTurn = false;
+      const settled = () => {
+        if (plainTurn) workers--;
+        active.delete(done.promise);
+        done.resolve();
+      };
       active.add(done.promise);
       const client = new AbortController();
       const signal = AbortSignal.any([request.signal, client.signal, stop.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
@@ -128,16 +140,32 @@ async function serve(directory: string, port: number, keyHash: Buffer): Promise<
           try { modelId = decodeURIComponent(generate[1]); }
           catch { throw new AgyError("invalid_request", "Invalid model resource name"); }
         }
+        const protocol: ToolProtocol = generate ? "gemini" : chat ? "openai" : "anthropic";
         const { request: body, includeUsage } = chat
           ? parseChatCompletion(payload)
           : { request: generate ? parseGeminiContent(payload, modelId, generate[2] === "streamGenerateContent") : parseMessage(payload), includeUsage: false };
         const selected = resolveAcpModelSelection(body.model, undefined, catalog.catalog);
         const model = selected.requestedModel;
-        const events = textTurn({ directory, detection, selected, request: body, signal });
-        if (!body.stream) {
-          const respond = generate ? geminiJson : chat ? openAIJson : jsonMessage;
-          return await respond(events, model);
+        const turn = { directory, detection, selected, request: body };
+        let tools: ClientToolTurn | undefined;
+        const { responses } = body;
+        if (responses) {
+          tools = [...toolTurns].find(turn => turn.protocol === protocol && turn.owns(responses[0].id));
+          if (!tools) throw new AgyError("invalid_request", "The tool call is unknown, expired, or already resumed");
+          signal.throwIfAborted();
+          tools.resume(protocol, model, responses, body.steering);
+        } else {
+          if (workers >= MAX_IN_FLIGHT) throw new AgyError("overload", "The service is at its concurrency limit");
+          if (body.tools) {
+            const pending = new ClientToolTurn(turn, body.tools, protocol);
+            tools = pending;
+            toolTurns.add(pending);
+            void pending.done.then(() => { toolTurns.delete(pending); workers--; });
+          } else plainTurn = true;
+          workers++;
         }
+        const events = tools ? tools.segment(signal) : textTurn({ ...turn, signal });
+        if (!body.stream) return await (generate ? geminiJson : chat ? openAIJson : jsonMessage)(events, model);
         const frames = generate ? geminiStream(model) : chat ? openAIStream(model, includeUsage) : anthropicStream(model);
         const response = await streamTurn(events, frames, signal, () => client.abort(), settled);
         streaming = true;
@@ -164,7 +192,7 @@ async function serve(directory: string, port: number, keyHash: Buffer): Promise<
       ]);
       stop.abort(new AgyError("overload", "The service is shutting down"));
       if (!graceful) await server.stop(true);
-      await drained;
+      await Promise.all([drained, ...[...toolTurns].map(turn => turn.close())]);
     } finally {
       clearTimeout(timer);
       await closed;
@@ -176,7 +204,7 @@ async function serve(directory: string, port: number, keyHash: Buffer): Promise<
   const onSignal = () => { void shutdown().catch(finished.reject); };
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);
-  console.log(`agy-api listening on http://127.0.0.1:${server.port}`);
+  console.log(`agy-api listening on ${server.url.origin}`);
   discovery = (async () => {
     try {
       detection = await ensureAcpServer(undefined, stop.signal);
