@@ -8,14 +8,12 @@ fail() {
 }
 
 usage() {
-    printf '%s\n' 'Usage: install.sh [--version agy-api-vX.Y.Z | --from-dir DIR] [--enable-linger]' \
-        'Installs and starts the agy-api systemd user service.' \
-        'Use --enable-linger to start it at boot without logging in.'
+    printf '%s\n' 'Usage: install.sh [--version agy-api-vX.Y.Z | --from-dir DIR]' \
+        'Installs and starts agy-api, with automatic startup at boot.'
 }
 
 version=
 source_dir=
-linger=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version)
@@ -33,7 +31,7 @@ while [ "$#" -gt 0 ]; do
             source_dir=$2
             shift
             ;;
-        --enable-linger) linger=1 ;;
+        --enable-linger) ;; # Accept existing install commands.
         -h|--help) usage; exit 0 ;;
         *) fail "Unknown option: $1" ;;
     esac
@@ -52,6 +50,7 @@ awk -v version="$libc" 'BEGIN {
     exit !(parts[1] > 2 || (parts[1] == 2 && parts[2] >= 27))
 }' || fail 'Requires glibc 2.27 or newer.'
 command -v systemctl >/dev/null || fail 'Requires systemd and its systemctl command.'
+command -v loginctl >/dev/null || fail 'Requires systemd and its loginctl command.'
 
 asset=agy-api-linux-x86_64
 release=https://github.com/jeffusion/opencode-antigrvity/releases
@@ -107,6 +106,12 @@ chmod 0755 -- "$stage/$asset"
 "$stage/$asset" --help > "$stage/help" && grep -Fxq 'Usage: agy-api' "$stage/help" ||
     fail 'The verified binary did not pass its --help check.'
 
+account=$(id -un)
+if [ "$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)" != yes ]; then
+    loginctl enable-linger "$account" ||
+        fail "Could not enable boot startup. Ask an administrator to run: sudo loginctl enable-linger $account"
+fi
+
 mkdir -p -- "$confdir" "$unitdir"
 if [ ! -e "$env_file" ] && [ ! -L "$env_file" ]; then
     config_stage=$(mktemp -d "$confdir/.agy-api.XXXXXXXX")
@@ -151,15 +156,6 @@ if [ -e "$bindir/agy-api" ]; then
 fi
 mv -fT -- "$stage/$asset" "$bindir/agy-api"
 
-linger_failed=0
-if [ "$linger" -eq 1 ]; then
-    account=$(id -un)
-    if ! loginctl enable-linger "$account"; then
-        printf 'Could not enable linger. Ask an administrator to run: loginctl enable-linger %s\n' "$account" >&2
-        linger_failed=1
-    fi
-fi
 systemctl --user daemon-reload && systemctl --user enable "$unit" && systemctl --user "$action" "$unit" ||
     fail "Installed at $bindir/agy-api, but systemd setup failed. Run: systemctl --user daemon-reload && systemctl --user enable $unit && systemctl --user restart $unit"
 printf 'agy-api installed at %s\nEnvironment file: %s\n' "$bindir/agy-api" "$env_file"
-[ "$linger_failed" -eq 0 ]

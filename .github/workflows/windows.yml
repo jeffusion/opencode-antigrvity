@@ -67,9 +67,6 @@ jobs:
     concurrency:
       group: agy-api-release-${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: agy-api-linux-x86_64
@@ -89,8 +86,7 @@ jobs:
           # Creation fails if this tag already has a published release.
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
             "$RUNNER_TEMP/agy-api-release/agy-api-linux-x86_64" \
-            "$RUNNER_TEMP/agy-api-release/agy-api-linux-x86_64.sha256" \
-            scripts/install.sh
+            "$RUNNER_TEMP/agy-api-release/agy-api-linux-x86_64.sha256"
   macos:
     if: github.event_name != 'push' || github.ref_type != 'tag'
     # actions/runner-images lists macos-15 as ARM64; assert architecture in test.

@@ -30,9 +30,9 @@ bun run --bun tsc -p tsconfig.json --watch # Run TypeScript under Bun while watc
 bun run check                     # Build and full tests before submitting changes
 ```
 
-This repository is a plugin/library, not a standalone development server.
-The package entrypoint is `src/index.ts`; generated output lives in the ignored
-`dist/` directory. The build type-checks `src/`, not the test files.
+The OpenCode plugin entrypoint is `src/index.ts`. The standalone service
+entrypoint is `src/service.ts`. Generated output lives in the ignored
+`dist/` directory, and the build type-checks `src/`.
 The OpenCode host must provide Bun at runtime. Imports from `node:` in source
 and tests use Bun's Node.js API compatibility layer; they do not launch or
 require the Node executable. TypeScript and the fake ACP test executable are
@@ -98,25 +98,27 @@ compatibility testing.
 The fork's Linux CI job builds the executable and uploads
 `agy-api-linux-x86_64` and `agy-api-linux-x86_64.sha256` as an Actions
 artifact. A push of a tag such as `agy-api-v1.0.0` to the fork creates a
-GitHub Release after the Linux checks pass. The Release also includes
-`install.sh`. An existing published release keeps its original assets.
+GitHub Release with the binary and checksum after the Linux checks pass.
 
 ### Install with systemd
 
-On Linux x86_64 with glibc 2.27 or newer, download the installer from the
-[fork releases](https://github.com/jeffusion/opencode-antigrvity/releases)
+On Linux x86_64 with glibc 2.27 or newer, download the
+[installer from main](https://raw.githubusercontent.com/jeffusion/opencode-antigrvity/main/scripts/install.sh)
 and run it as the account that will own the service:
 
 ```sh
-sh install.sh --enable-linger
+sh install.sh
 ```
 
-Use `--version agy-api-v1.0.0` to pin a published tag, or `--from-dir DIR`
-to install from the binary and checksum downloaded from Actions or Releases.
-The installer enables and starts `agy-api.service` and restarts it on upgrades.
-With lingering enabled, systemd starts the user manager at boot even when
-the account has no interactive session. If the account cannot enable lingering,
-an administrator can run `sudo loginctl enable-linger <account>`.
+The installer uses the latest GitHub Release by default. Use
+`--version agy-api-v1.0.0` to pin a published binary and checksum, or
+`--from-dir DIR` to install from local copies of those two files.
+The installer starts `agy-api.service`, enables boot startup even without an
+interactive login, and restarts the service on upgrades. If systemd requires
+administrator permission for boot startup, run
+`sudo loginctl enable-linger <account>` as an administrator, then retry the
+installer as the service account. Stop and disable the service with
+`systemctl --user disable --now agy-api.service`.
 
 The API key and port are configured in
 `${XDG_CONFIG_HOME:-$HOME/.config}/agy-api/agy-api.env`. If the account uses a

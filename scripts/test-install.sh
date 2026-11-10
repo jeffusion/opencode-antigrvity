@@ -41,9 +41,13 @@ MOCK
 cat > "$scratch/mock/loginctl" <<'MOCK'
 #!/bin/sh
 set -eu
-[ "$#" -eq 2 ] && [ "$1" = enable-linger ] && [ "$2" = "$(id -un)" ]
+account=$(id -un)
 printf 'loginctl %s\n' "$*" >> "$TEST_LOG"
-[ "$MOCK_LINGER_FAIL" = 0 ]
+case "$*" in
+    "show-user $account -p Linger --value") printf '%s\n' "$MOCK_LINGER_STATE" ;;
+    "enable-linger $account") [ "$MOCK_LINGER_FAIL" = 0 ] ;;
+    *) exit 2 ;;
+esac
 MOCK
 cat > "$scratch/mock/curl" <<'MOCK'
 #!/bin/sh
@@ -62,6 +66,7 @@ run_install() {
     env -i HOME="$test_home" XDG_CONFIG_HOME="$test_config" XDG_DATA_HOME="$test_data" \
         TMPDIR="$scratch" PATH="$scratch/mock:/usr/bin:/bin" TEST_LOG="$log" TEST_RELEASE="$release" \
         MOCK_CURL_FAIL="${MOCK_CURL_FAIL:-0}" MOCK_LINGER_FAIL="${MOCK_LINGER_FAIL:-0}" \
+        MOCK_LINGER_STATE="${MOCK_LINGER_STATE:-no}" \
         MOCK_RELOAD_FAIL="${MOCK_RELOAD_FAIL:-0}" MOCK_OLD_GLIBC="${MOCK_OLD_GLIBC:-0}" \
         sh "$installer" "$@" > "$output" 2>&1
 }
@@ -103,7 +108,9 @@ if grep -Fq -- "$key" "$output"; then
     exit 1
 fi
 unset key
-diff -u - "$log" <<'LOG'
+diff -u - "$log" <<LOG
+loginctl show-user $(id -un) -p Linger --value
+loginctl enable-linger $(id -un)
 systemctl --user daemon-reload
 systemctl --user enable agy-api.service
 systemctl --user start agy-api.service
@@ -113,32 +120,34 @@ sed -i 's/^AGY_PORT=.*/AGY_PORT=18787/' "$env_file"
 cp -- "$env_file" "$scratch/saved.env"
 chmod 0644 -- "$env_file"
 first_inode=$(stat -c %i "$bin")
-run_install --version agy-api-v1.2.3 --enable-linger || { cat "$output" >&2; exit 1; }
+MOCK_LINGER_STATE=yes run_install --version agy-api-v1.2.3 --enable-linger || { cat "$output" >&2; exit 1; }
 [ "$(stat -c %i "$bin")" != "$first_inode" ]
 cmp -- "$scratch/saved.env" "$env_file"
 [ "$(stat -c %a "$env_file")" = 600 ]
 diff -u - "$log" <<LOG
 curl https://github.com/jeffusion/opencode-antigrvity/releases/download/agy-api-v1.2.3/$asset
 curl https://github.com/jeffusion/opencode-antigrvity/releases/download/agy-api-v1.2.3/$asset.sha256
-loginctl enable-linger $(id -un)
+loginctl show-user $(id -un) -p Linger --value
 systemctl --user daemon-reload
 systemctl --user enable agy-api.service
 systemctl --user restart agy-api.service
 LOG
 
-MOCK_LINGER_FAIL=1 expect_failure 'Ask an administrator to run: loginctl enable-linger' --enable-linger
+bin_inode=$(stat -c %i "$bin")
+MOCK_LINGER_FAIL=1 expect_failure 'Ask an administrator to run: sudo loginctl enable-linger'
 diff -u - "$log" <<LOG
 curl https://github.com/jeffusion/opencode-antigrvity/releases/latest/download/$asset
 curl https://github.com/jeffusion/opencode-antigrvity/releases/latest/download/$asset.sha256
+loginctl show-user $(id -un) -p Linger --value
 loginctl enable-linger $(id -un)
-systemctl --user daemon-reload
-systemctl --user enable agy-api.service
-systemctl --user restart agy-api.service
 LOG
+unset bin_inode
 
-MOCK_RELOAD_FAIL=1 expect_failure 'Run: systemctl --user daemon-reload && systemctl --user enable agy-api.service && systemctl --user restart agy-api.service' --from-dir "$release"
-grep -Fxq 'systemctl --user daemon-reload' "$log"
-[ "$(wc -l < "$log")" -eq 1 ]
+MOCK_LINGER_STATE=yes MOCK_RELOAD_FAIL=1 expect_failure 'Run: systemctl --user daemon-reload && systemctl --user enable agy-api.service && systemctl --user restart agy-api.service' --from-dir "$release"
+diff -u - "$log" <<LOG
+loginctl show-user $(id -un) -p Linger --value
+systemctl --user daemon-reload
+LOG
 
 bin_inode=$(stat -c %i "$bin")
 MOCK_OLD_GLIBC=1 expect_failure 'Requires glibc 2.27 or newer.' --from-dir "$release"
