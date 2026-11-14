@@ -18,6 +18,8 @@ function resultImageBlocks(images?: GeminiResultImage[]): ServiceContentBlock[] 
 const REQUEST_FIELDS = new Set(["contents", "systemInstruction", "generationConfig", "tools", "toolConfig"]);
 const GENERATION_FIELDS = new Set(["maxOutputTokens", "candidateCount", "responseMimeType"]);
 const TOOL_FIELDS = new Set(["name", "description", "parameters", "parametersJsonSchema"]);
+// OpenCode's @ai-sdk/google marks reasoning history parts with thought flags; ACP rebuilds history, so only text is kept.
+const TEXT_FIELDS = new Set(["text", "thought", "thoughtSignature"]);
 const FINISH_REASONS = {
   end_turn: "STOP",
   stop_sequence: "STOP",
@@ -168,7 +170,11 @@ function parseContent(content: unknown, allowTools = true) {
       }
     }
     if (isObject(part)) {
-      if (typeof part.text === "string" && Object.keys(part).length === 1) return { type: "text", text: part.text };
+      if (Object.keys(part).every(key => TEXT_FIELDS.has(key)) && typeof part.text === "string" &&
+          (part.thought === undefined || typeof part.thought === "boolean") &&
+          (part.thoughtSignature === undefined || typeof part.thoughtSignature === "string")) {
+        return { type: "text", text: part.text };
+      }
       if (part.inlineData !== undefined && Object.keys(part).every(key => key === "inlineData" || key === "mediaResolution")) {
         const resolution = part.mediaResolution;
         if (resolution !== undefined && (!isObject(resolution) || Object.keys(resolution).length !== 1 ||

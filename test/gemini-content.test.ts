@@ -27,6 +27,30 @@ test("Gemini requests map text, roles, system instructions and output budget", (
   expect(parseGeminiContent({ contents }, model, false).maxTokens).toBe(4096);
 });
 
+test("Gemini accepts OpenCode thought and signature metadata as read-only assistant text", () => {
+  expect(parseGeminiContent({
+    contents: [
+      { role: "user", parts: [{ text: "First" }] },
+      { role: "model", parts: [
+        { text: "Reasoning", thought: true, thoughtSignature: "sig-a" },
+        { text: "Answer" },
+        { text: "More", thought: false, thoughtSignature: "sig-b" },
+      ] },
+      { role: "user", parts: [{ text: "Second" }] },
+    ],
+  }, model, true).history).toEqual([
+    { role: "user", content: "First" },
+    { role: "assistant", content: "Reasoning\nAnswer\nMore" },
+    { role: "user", content: "Second" },
+  ]);
+  const unroled = { contents: [{ parts: [{ text: "Question", thought: true }] }] };
+  expect(parseGeminiContent(unroled, model, false).history).toEqual([{ role: "user", content: "Question" }]);
+  expect(parseGeminiContent({
+    contents: [{ role: "user", parts: [{ text: "Question" }] }],
+    systemInstruction: { parts: [{ text: "Rules", thoughtSignature: "sig-c" }] },
+  }, model, false).system).toBe("Rules");
+});
+
 test("Gemini requests reject unsupported and malformed input", () => {
   for (const fields of [
     { tools: [{ googleSearch: {} }] },
@@ -42,7 +66,12 @@ test("Gemini requests reject unsupported and malformed input", () => {
     { generationConfig: { maxOutputTokens: 0 } },
     { contents: [{ role: "assistant", parts: [{ text: "Question" }] }] },
     { contents: [{ role: "model", parts: [{ text: "Question" }] }] },
-    { contents: [{ parts: [{ text: "Question", thought: true }] }] },
+    { contents: [{ parts: [{ text: "Question", thought: "yes" }] }] },
+    { contents: [{ parts: [{ text: "Question", thoughtSignature: 7 }] }] },
+    { contents: [{ parts: [{ text: "Question", extra: true }] }] },
+    { contents: [{ parts: [{ text: "Question", inlineData: { data: "AAAA", mimeType: "image/png" } }] }] },
+    { contents: [{ parts: [{ thought: true }] }] },
+    { contents: [{ parts: [{ text: "Question", thought: true, functionCall: { name: "f" } }] }] },
     { contents: [{ parts: [] }] },
     { contents: [{ parts: [{ fileData: { fileUri: "gs://bucket/image.png", mimeType: "image/png" } }] }] },
     { contents: [{ parts: [{ inlineData: { data: "AAAA", mimeType: "audio/wav" } }] }] },
