@@ -8,6 +8,7 @@ import { AgyError } from "./errors.js";
 import { acquireFileLock } from "./file-lock.js";
 import { geminiErrorResponse, geminiJson, geminiStream, parseGeminiContent } from "./gemini-content.js";
 import { ModelCatalog } from "./model-catalog.js";
+import { refreshModelMetadata } from "./model-metadata.js";
 import { resolveAcpModelSelection } from "./models.js";
 import { openAIErrorResponse, openAIJson, openAIStream, parseChatCompletion } from "./openai-chat.js";
 import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn } from "./service-messages.js";
@@ -87,6 +88,7 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
   let workers = 0;
   let draining = false;
   let discovery: Promise<void> | undefined;
+  let metadataTimer: ReturnType<typeof setInterval> | undefined;
   let detection: Awaited<ReturnType<typeof ensureAcpServer>> | undefined;
   const catalog = new ModelCatalog(directory, { cache: false });
   const ready = () => !draining && detection && catalog.catalog.source === "acp" && catalog.catalog.models.length > 0 && !catalog.lastError;
@@ -181,6 +183,7 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
   async function shutdown(): Promise<void> {
     if (draining) return;
     draining = true;
+    clearInterval(metadataTimer);
     const closed = catalog.close();
     const httpClosed = server.stop(false);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -210,6 +213,10 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
       detection = await ensureAcpServer(undefined, stop.signal);
       if (draining) return;
       process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = detection.executable;
+      await refreshModelMetadata();
+      if (draining) return;
+      metadataTimer = setInterval(() => { void refreshModelMetadata(); }, 24 * 60 * 60_000);
+      metadataTimer.unref();
       await catalog.start();
       console.log(ready() ? "agy-api model catalog ready" : "agy-api model catalog unavailable. Check the ACP installation and agy login.");
     } catch {
