@@ -13,10 +13,28 @@ export type AnthropicUsage = {
 
 export type AnthropicFinishReason = "end_turn" | "max_tokens" | "stop_sequence" | "refusal";
 export type OrderedSegment = { kind: "text" | "thinking" | "activity"; text: string };
+export type AnthropicContentBlock = { type: "text"; text: string } | { type: "thinking"; thinking: string; signature?: string };
+
+export function anthropicContentBlock(kind: "text" | "thinking", text = ""): AnthropicContentBlock {
+  return kind === "text" ? { type: "text", text } : { type: "thinking", thinking: text };
+}
+
+/** Synthetic, non-upstream signatures: enough for hosts to replay the block,
+ * never presented as an upstream signature. */
+export function anthropicSignature(index: number): string {
+  return `agy-${index}`;
+}
+
+export function anthropicStreamSignature(id: string, index: number): string {
+  return `agy-${id}-${index}`;
+}
 
 /** The same ordered blocks used by the Anthropic response and durable boundary. */
-export function hostVisibleContent(segments: OrderedSegment[]): Array<{ type: "text"; text: string } | { type: "thinking"; thinking: string }> {
-  return segments.map(segment => segment.kind === "text" ? { type: "text", text: segment.text } : { type: "thinking", thinking: segment.text });
+export function hostVisibleContent(segments: OrderedSegment[], signature?: (index: number) => string): AnthropicContentBlock[] {
+  return segments.map((segment, index) => {
+    const block = anthropicContentBlock(segment.kind === "text" ? "text" : "thinking", segment.text);
+    return block.type === "thinking" && signature ? { ...block, signature: signature(index) } : block;
+  });
 }
 export type AcpTranslationState = { tools: Map<string, { title: string; failureShown?: boolean }>; terminal?: string };
 

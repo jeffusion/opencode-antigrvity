@@ -14,19 +14,22 @@ import {
   envNumber,
 } from "./constants.js";
 import { AgyError, AgyProtocolError, asAgyError } from "./errors.js";
-import { anthropicUsage, completionId, errorPayload, errorResponse, readJson, type AnthropicMessageRequest } from "./anthropic-http.js";
-import { error as logError, info, warn } from "./log.js";
+import { anthropicUsage, completionId, errorPayload, errorResponse, ignoreTemperature, readJson, type AnthropicMessageRequest } from "./anthropic-http.js";
+import { error as logError, info } from "./log.js";
 import { fallbackAcpModelCatalog, resolveAcpModelSelection, type AcpModelCatalog } from "./models.js";
 import { ModelCatalog } from "./model-catalog.js";
-import { normalizePrompt } from "./prompt.js";
+import { hostInstructions, normalizePrompt } from "./prompt.js";
 import { detectMetaRequestKind } from "./request-kind.js";
 import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, type OneShotResult } from "./utility.js";
 import { sessionStore } from "./session-store.js";
 import { readContextSnapshot } from "./telemetry.js";
 import { sessionPool } from "./session-pool.js";
 import type { AcpEvent, ContextOccupancy } from "./protocol.js";
-import { hostBridge, handleHostMcp, closeHostBridges, closeHostBridgesForScope, hostInstructions, type BridgeEvent } from "./host-tools.js";
+import { hostBridge, handleHostMcp, closeHostBridges, closeHostBridgesForScope, type BridgeEvent } from "./host-tools.js";
 import {
+  anthropicContentBlock,
+  anthropicSignature,
+  anthropicStreamSignature,
   appendResultWithoutDuplication,
   collectTurn,
   hostVisibleContent,
@@ -58,7 +61,6 @@ let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
 let runtime: RuntimeState | null = null;
 let startPromise: Promise<number> | null = null;
-let warnedTemperature = false;
 const workspaceRoots = new Set<string>();
 const catalogListeners = new Set<() => void>();
 
@@ -141,10 +143,6 @@ async function probeTurn(events: AsyncIterable<BridgeEvent>): Promise<ProbeResul
   return { error: new AgyProtocolError("The ACP agent ended without a response") };
 }
 
-function contentBlock(kind: "text" | "thinking", text = ""): Record<string, unknown> {
-  return kind === "text" ? { type: "text", text } : { type: "thinking", thinking: text };
-}
-
 function streamAnthropic(
   events: AsyncIterable<BridgeEvent>,
   model: string,
@@ -169,7 +167,7 @@ function streamAnthropic(
       const translation = createAcpTranslationState();
       const closeBlock = () => {
         if (!active) return;
-        if (active.kind === "thinking") send({ type: "content_block_delta", index: active.index, delta: { type: "signature_delta", signature: `agy-${id}-${active.index}` } });
+        if (active.kind === "thinking") send({ type: "content_block_delta", index: active.index, delta: { type: "signature_delta", signature: anthropicStreamSignature(id, active.index) } });
         send({ type: "content_block_stop", index: active.index });
         active = undefined;
       };
@@ -177,7 +175,7 @@ function streamAnthropic(
         if (active?.kind === kind) return;
         closeBlock();
         active = { index: nextBlockIndex++, kind };
-        send({ type: "content_block_start", index: active.index, content_block: contentBlock(kind) });
+        send({ type: "content_block_start", index: active.index, content_block: anthropicContentBlock(kind) });
       };
       const emitBlock = (kind: "text" | "thinking", text: string, separate = false) => {
         if (!text) return;
@@ -254,7 +252,7 @@ function utilityMessage(result: OneShotResult, model: string): Response {
 }
 
 function collectedMessage(collected: Awaited<ReturnType<typeof collectTurn>>, model: string, usage: AnthropicUsage | undefined): Response {
-  const content = hostVisibleContent(collected.segments).map((part, index) => part.type === "thinking" ? { ...part, signature: `agy-${index}` } : part);
+  const content = hostVisibleContent(collected.segments, anthropicSignature);
   return Response.json({ id: completionId(), type: "message", role: "assistant", model, content, stop_reason: collected.finishReason, stop_sequence: null, usage: anthropicUsage(usage) });
 }
 
@@ -265,7 +263,7 @@ function utilityStream(result: OneShotResult, model: string): Response {
     start(controller) {
       const send = (payload: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
       send({ type: "message_start", message: { id, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: anthropicUsage(undefined) } });
-      send({ type: "content_block_start", index: 0, content_block: contentBlock("text") });
+      send({ type: "content_block_start", index: 0, content_block: anthropicContentBlock("text") });
       if (result.response) send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: result.response } });
       send({ type: "content_block_stop", index: 0 });
       send({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: anthropicUsage(result.usage) });
@@ -285,7 +283,8 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   // Decline before discovery, prompt normalization, or touching the ACP turn.
   if (metaKind === "compaction") throw new AgyError("unsupported", "Compaction is managed internally by Antigravity; OpenCode compaction is disabled.", { code: "agy_internal_compaction", retryable: false });
   if ((body.stop_sequences !== undefined && (!Array.isArray(body.stop_sequences) || body.stop_sequences.length > 0)) || body.top_p !== undefined || body.top_k !== undefined || body.output_config !== undefined || body.response_format !== undefined) throw new AgyError("unsupported", "ACP does not enforce native sampling, stop sequences or JSON-schema output. Use host structured-output tools instead.", { code: "agy_unsupported_control" });
-  if (body.temperature !== undefined && !warnedTemperature) { warnedTemperature = true; warn("Ignoring temperature: sampling is owned by ACP", { reason: "unsupported_temperature" }); }
+  // Sampling is owned by ACP: accept a finite temperature for client compatibility, never claim it applies.
+  ignoreTemperature(body.temperature);
   if (body.max_tokens !== undefined && (typeof body.max_tokens !== "number" || !Number.isSafeInteger(body.max_tokens) || body.max_tokens <= 0)) throw new AgyError("invalid_request", "max_tokens must be a positive integer budget");
   if (body.tool_choice !== undefined && body.tool_choice !== "auto" && !(body.tool_choice && typeof body.tool_choice === "object" && (body.tool_choice as any).type === "auto")) throw new AgyError("unsupported", "ACP currently supports automatic OpenCode tool selection only");
   if (!runtime) throw new AgyError("internal", "The Antigravity proxy runtime is not initialized", { code: "agy_runtime_uninitialized" });

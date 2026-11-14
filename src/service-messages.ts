@@ -3,24 +3,34 @@ import { join } from "node:path";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { createAcpWorker, type AcpWorkerOptions } from "./acp-process.js";
 import type { AcpServerDetection } from "./acp-detect.js";
-import { anthropicUsage, completionId, errorPayload, type AnthropicMessageRequest } from "./anthropic-http.js";
+import { anthropicUsage, completionId, errorPayload, ignoreTemperature, type AnthropicMessageRequest } from "./anthropic-http.js";
 import { mediaBytes, reserveMedia, type MediaMaterializationBudget } from "./attachments.js";
 import { historyCharacterLimit } from "./budget.js";
 import { DEFAULT_SSE_HEARTBEAT_MS } from "./constants.js";
 import { AgyAbortError, AgyError, AgyProtocolError, retryAfterSeconds } from "./errors.js";
 import type { HostTool } from "./host-tools.js";
 import type { AcpModelSelection } from "./models.js";
-import { quotedHostMessage } from "./prompt.js";
+import { hostInstructions, partText, quotedBlocks } from "./prompt.js";
 import { HarnessFailureGuard, type AcpEvent } from "./protocol.js";
 import { reconstruct } from "./reconstruction.js";
-import { createAcpTranslationState, mapAcpEvent, type AnthropicFinishReason, type AnthropicUsage } from "./translate.js";
+import {
+  anthropicContentBlock,
+  anthropicSignature,
+  anthropicStreamSignature,
+  createAcpTranslationState,
+  hostVisibleContent,
+  mapAcpEvent,
+  type AnthropicFinishReason,
+  type AnthropicUsage,
+  type OrderedSegment,
+} from "./translate.js";
 
 const MAX_UPDATE_BYTES = 1024 * 1024;
 const SSE_BUFFER_BYTES = 128 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_TOTAL_BYTES = 8 * 1024 * 1024;
 const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-const MESSAGE_FIELDS = new Set(["model", "system", "messages", "max_tokens", "stream", "tools", "tool_choice"]);
+const MESSAGE_FIELDS = new Set(["model", "system", "messages", "max_tokens", "temperature", "stream", "tools", "tool_choice"]);
 export const MAX_CLIENT_TOOLS = 128;
 export const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MODEL_FORMAT_FAILURE = "Agent execution error: model output error: encountered an improper format stop reason.\nPlease retry with a properly formatted function call.";
@@ -68,19 +78,41 @@ function parseTools(tools: unknown): HostTool[] {
   return declarations;
 }
 
-function textContent(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (!Array.isArray(value)) invalid("Content must be a string or an array of text blocks");
-  return value.map((part) => {
-    if (part?.type !== "text" || typeof part.text !== "string") invalid("Only text content blocks are supported");
-    return part.text;
-  }).join("\n");
+/** Strict read of one content part for the public service. Thinking keeps its
+ * body and may carry a signature, which is dropped here; redacted thinking is
+ * opaque and contributes no text. Malformed or unknown parts are rejected. */
+function readableText(part: unknown, role: "user" | "assistant"): string {
+  if (!isObject(part)) invalid("Only text content blocks are supported");
+  if (part.type === "thinking" || part.type === "redacted_thinking") {
+    // Reasoning blocks are assistant history only; user, system and tool
+    // result content keep the original text/image range.
+    if (role !== "assistant") invalid("Thinking blocks are only supported in assistant history");
+    const fields = part.type === "thinking" ? ["type", "thinking", "signature"] : ["type", "data"];
+    if (Object.keys(part).some(key => !fields.includes(key))) {
+      invalid(part.type === "thinking" ? "Invalid thinking block" : "Invalid redacted_thinking block");
+    }
+    return partText(part) ?? "";
+  }
+  if (part.type !== "text" || typeof part.text !== "string") invalid("Only text and thinking content blocks are supported");
+  return part.text;
 }
 
-function messageContent(value: unknown, budget: MediaMaterializationBudget): string | ServiceContentBlock[] {
-  if (!Array.isArray(value) || !value.some(part => part?.type === "image")) return textContent(value);
-  return Array.from(value, (part): ServiceContentBlock => {
-    if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text };
+function textContent(value: unknown, role: "user" | "assistant" = "user"): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) invalid("Content must be a string or an array of text blocks");
+  return value.map(part => readableText(part, role)).filter(Boolean).join("\n");
+}
+
+function messageContent(value: unknown, budget: MediaMaterializationBudget, role: "user" | "assistant"): string | ServiceContentBlock[] {
+  if (!Array.isArray(value) || !value.some(part => part?.type === "image")) return textContent(value, role);
+  const blocks: ServiceContentBlock[] = [];
+  for (const part of value) {
+    if (part?.type === "text" && typeof part.text === "string") { blocks.push({ type: "text", text: part.text }); continue; }
+    if (part?.type === "thinking" || part?.type === "redacted_thinking") {
+      const text = readableText(part, role);
+      if (text) blocks.push({ type: "text", text });
+      continue;
+    }
     if (part?.type !== "image") invalid("Only text and inline image blocks are supported");
     const { source } = part;
     if (Object.keys(part).some(key => key !== "type" && key !== "source") ||
@@ -92,12 +124,18 @@ function messageContent(value: unknown, budget: MediaMaterializationBudget): str
     const bytes = mediaBytes(source.data);
     if (bytes > MAX_IMAGE_BYTES) throw new AgyError("invalid_request", "The image is too large", { code: "agy_attachment_too_large" });
     reserveMedia(budget, bytes);
-    return { type: "image", mimeType: source.media_type, data: source.data };
-  });
+    blocks.push({ type: "image", mimeType: source.media_type, data: source.data });
+  }
+  return blocks;
 }
 
 function contentBlocks(content: string | ServiceContentBlock[]): ServiceContentBlock[] {
   return typeof content === "string" ? (content ? [{ type: "text", text: content }] : []) : content;
+}
+
+function redactedOnly(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0 &&
+    value.every(part => isObject(part) && part.type === "redacted_thinking");
 }
 
 function parseToolUse(part: Record<string, unknown>): ClientToolCall {
@@ -110,7 +148,7 @@ function parseToolUse(part: Record<string, unknown>): ClientToolCall {
 function parseToolResult(part: Record<string, unknown>, media: MediaMaterializationBudget): ClientToolResult {
   if (!toolId(part.tool_use_id) || (part.is_error !== undefined && typeof part.is_error !== "boolean") ||
       Object.keys(part).some(key => !["type", "tool_use_id", "content", "is_error"].includes(key))) invalid("Invalid tool_result block");
-  return { id: part.tool_use_id, content: contentBlocks(messageContent(part.content === undefined ? "" : part.content, media)),
+  return { id: part.tool_use_id, content: contentBlocks(messageContent(part.content === undefined ? "" : part.content, media, "user")),
     isError: part.is_error === true };
 }
 
@@ -133,8 +171,12 @@ function parseHistory(messages: unknown[]) {
     pending = new Map();
     if (!toolBlocks) {
       if (previous.size) invalid("Tool results must immediately follow the assistant tool calls");
-      const content = messageContent(raw, media);
-      if (typeof content === "string" && !content.trim()) invalid("Messages must contain nonempty text");
+      const content = messageContent(raw, media, role);
+      // Ordinary empty turns stay invalid. An assistant turn with only legal
+      // redacted reasoning keeps its (empty) place in history so tool ordering
+      // and causality are unaffected.
+      if (typeof content === "string" && !content.trim() &&
+          (role === "user" || !redactedOnly(raw))) invalid("Messages must contain nonempty text");
       if (responses.length) steering.push(...contentBlocks(content));
       return { role, content };
     }
@@ -162,7 +204,7 @@ function parseHistory(messages: unknown[]) {
         blocks.push({ type: "text", text: `[function result ${result.id}${result.isError ? " error" : ""}]` }, ...result.content);
       } else {
         ordinaryContent = true;
-        const content = contentBlocks(messageContent([part], media));
+        const content = contentBlocks(messageContent([part], media, role));
         blocks.push(...content);
         if (index > lastAssistant && results.length) steering.push(...content);
       }
@@ -177,6 +219,7 @@ function parseHistory(messages: unknown[]) {
 
 export function parseMessage(body: AnthropicMessageRequest) {
   if (Object.keys(body).some(key => !MESSAGE_FIELDS.has(key))) invalid("Unsupported Messages request field");
+  ignoreTemperature(body.temperature);
   const { model, messages, max_tokens, stream, tool_choice } = body;
   if (typeof model !== "string" || !model.trim() || model.length > 256) invalid("model must be a nonempty model ID");
   if (typeof max_tokens !== "number" || !Number.isSafeInteger(max_tokens) || max_tokens <= 0) invalid("max_tokens must be a positive integer");
@@ -210,12 +253,12 @@ export async function* textTurn({ directory, detection, selected, request, signa
   const groups = request.history.map((message, index) => {
     const operative = index === last;
     const { content, role } = message;
-    const blocks: ContentBlock[] = typeof content === "string"
-      ? [{ type: "text", text: operative ? content : quotedHostMessage(message) }]
-      : operative ? content : [{ type: "text", text: `[${role}]` }, ...content];
+    const blocks: ContentBlock[] = operative
+      ? (typeof content === "string" ? [{ type: "text", text: content }] : content)
+      : quotedBlocks(role, typeof content === "string" ? (content ? [{ type: "text", text: content }] : []) : content);
     return { message, operative, blocks, toolIds: message.toolIds };
   });
-  const prompt = reconstruct(groups, request.system, selected.acpModel, historyCharacterLimit(), request.maxTokens);
+  const prompt = reconstruct(groups, hostInstructions(request.system), selected.acpModel, historyCharacterLimit(), request.maxTokens);
   signal.throwIfAborted();
   const workspace = await mkdtemp(join(directory, "request-"));
   let worker: Awaited<ReturnType<typeof createAcpWorker>> | undefined;
@@ -240,7 +283,8 @@ export async function* textTurn({ directory, detection, selected, request, signa
       if (update.event === "update" && update.update.sessionUpdate !== "agent_message_chunk" &&
           update.update.sessionUpdate !== "agent_thought_chunk") continue;
       for (const event of guard.push(update)) {
-        if (event.event === "result" || event.update.sessionUpdate === "agent_message_chunk") yield event;
+        if (event.event === "result") yield event;
+        else if (event.update.sessionUpdate === "agent_message_chunk" || event.update.sessionUpdate === "agent_thought_chunk") yield event;
       }
     }
   } finally {
@@ -270,6 +314,7 @@ export type ServiceTurnEvent = AcpEvent | { event: "function_calls"; calls: Clie
 
 export async function collectServiceTurn(events: AsyncIterable<ServiceTurnEvent>) {
   let content = "";
+  const segments: OrderedSegment[] = [];
   let terminal: Extract<ReturnType<typeof mapAcpEvent>, { kind: "result" }> | Extract<ServiceTurnEvent, { event: "function_calls" }> | undefined;
   const translation = createAcpTranslationState();
   for await (const event of events) {
@@ -279,13 +324,22 @@ export async function collectServiceTurn(events: AsyncIterable<ServiceTurnEvent>
     }
     const mapped = mapAcpEvent(event, translation);
     if (mapped.kind === "error") throw mapped.error;
-    if (mapped.kind === "text") content += mapped.text;
+    if (mapped.kind === "text") {
+      content += mapped.text;
+      const last = segments.at(-1);
+      if (last?.kind === "text") last.text += mapped.text;
+      else segments.push({ kind: "text", text: mapped.text });
+    } else if (mapped.kind === "reasoning") {
+      const last = segments.at(-1);
+      if (last?.kind === "thinking") last.text += mapped.text;
+      else segments.push({ kind: "thinking", text: mapped.text });
+    }
     if (mapped.kind === "result") terminal = mapped;
   }
   if (!terminal) throw new AgyError("protocol", "The ACP agent ended a turn without a result", { code: "agy_acp_missing_result" });
   return "event" in terminal
-    ? { content, finishReason: "tool_use" as const, calls: terminal.calls }
-    : { content, finishReason: terminal.finishReason, usage: terminal.usage, rawUsage: terminal.result.usage };
+    ? { content, segments, finishReason: "tool_use" as const, calls: terminal.calls }
+    : { content, segments, finishReason: terminal.finishReason, usage: terminal.usage, rawUsage: terminal.result.usage };
 }
 
 type ServiceFinishReason = AnthropicFinishReason | "tool_use";
@@ -294,20 +348,22 @@ function anthropicToolCall({ id, name, args }: ClientToolCall) {
   return { type: "tool_use" as const, id, name, input: args };
 }
 
-function message(id: string, model: string, text: string, reason: ServiceFinishReason | null, usage?: AnthropicUsage, calls: ClientToolCall[] = []) {
+function message(id: string, model: string, content: unknown[], reason: ServiceFinishReason | null, usage?: AnthropicUsage, calls: ClientToolCall[] = []) {
   return { id, type: "message", role: "assistant", model,
-    content: [...(text ? [{ type: "text", text }] : []), ...calls.map(anthropicToolCall)],
+    content: [...content, ...calls.map(anthropicToolCall)],
     stop_reason: reason, stop_sequence: null, usage: anthropicUsage(usage) };
 }
 
 export async function jsonMessage(events: AsyncIterable<ServiceTurnEvent>, model: string): Promise<Response> {
   const result = await collectServiceTurn(events);
-  return Response.json(message(completionId(), model, result.content, result.finishReason, result.usage, result.calls));
+  const content = hostVisibleContent(result.segments, anthropicSignature);
+  return Response.json(message(completionId(), model, content, result.finishReason, result.usage, result.calls));
 }
 
 type StreamFrames = {
   start(): string[];
   text(delta: string): string[];
+  reasoning?(delta: string): string[];
   finish(reason: AnthropicFinishReason, usage?: AnthropicUsage, rawUsage?: unknown): string[];
   functions?(calls: ClientToolCall[]): Iterable<string>;
   error(error: AgyError): string;
@@ -334,25 +390,39 @@ export function anthropicStream(model: string): StreamFrames {
     frame({ type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage: anthropicUsage(usage) }),
     frame({ type: "message_stop" }),
   ];
-  let hasText = false;
+  let nextBlock = 0;
+  let active: { index: number; kind: "text" | "thinking" } | undefined;
+  const closeBlock = () => {
+    if (!active) return [];
+    const frames = active.kind === "thinking"
+      ? [frame({ type: "content_block_delta", index: active.index, delta: { type: "signature_delta", signature: anthropicStreamSignature(id, active.index) } })]
+      : [];
+    frames.push(stop(active.index));
+    active = undefined;
+    return frames;
+  };
+  const openBlock = (kind: "text" | "thinking") => {
+    if (active?.kind === kind) return [];
+    const frames = closeBlock();
+    active = { index: nextBlock++, kind };
+    frames.push(frame({ type: "content_block_start", index: active.index, content_block: anthropicContentBlock(kind) }));
+    return frames;
+  };
+  const delta = (kind: "text" | "thinking", text: string) => [
+    ...openBlock(kind),
+    frame({ type: "content_block_delta", index: active!.index, delta: kind === "text" ? { type: "text_delta", text } : { type: "thinking_delta", thinking: text } }),
+  ];
   return {
-    start: () => [frame({ type: "message_start", message: message(id, model, "", null) })],
-    text(delta) {
-      const frames = [];
-      if (!hasText) {
-        frames.push(frame({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-        hasText = true;
-      }
-      frames.push(frame({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta } }));
-      return frames;
-    },
+    start: () => [frame({ type: "message_start", message: message(id, model, [], null) })],
+    text: value => delta("text", value),
+    reasoning: value => delta("thinking", value),
     finish(reason, usage) {
-      return [...(hasText ? [stop(0)] : []), ...finish(reason, usage)];
+      return [...closeBlock(), ...finish(reason, usage)];
     },
     *functions(calls) {
-      if (hasText) yield stop(0);
-      for (const [offset, call] of calls.entries()) {
-        const index = offset + Number(hasText);
+      yield* closeBlock();
+      for (const call of calls) {
+        const index = nextBlock++;
         yield frame({ type: "content_block_start", index, content_block: { ...anthropicToolCall(call), input: {} } });
         for (const partial_json of sseTextChunks(toolJson(call.args))) {
           yield frame({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } });
@@ -421,8 +491,11 @@ export async function streamTurn(
             const mapped = mapAcpEvent(next.value);
             if (mapped.kind === "error") throw mapped.error;
             if (mapped.kind === "result") terminal = mapped;
-            if (mapped.kind !== "text") continue;
-            for (const delta of sseTextChunks(mapped.text)) await send(frames.text(delta));
+            if (mapped.kind === "text") {
+              for (const delta of sseTextChunks(mapped.text)) await send(frames.text(delta));
+            } else if (mapped.kind === "reasoning" && frames.reasoning) {
+              for (const delta of sseTextChunks(mapped.text)) await send(frames.reasoning(delta));
+            }
           }
           if (!terminal) throw new AgyProtocolError("The ACP agent ended without a response");
           await send(frames.finish(terminal.finishReason, terminal.usage, terminal.result.usage));
