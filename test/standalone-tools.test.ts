@@ -133,6 +133,7 @@ if (process.env.AGY_TEST_STANDALONE_CHILD === "1") {
       OPENCODE_ANTIGRAVITY_ACP_PATH: join(import.meta.dir, "fixtures", "fake-acp.mjs"),
       FAKE_ACP_PROMPT_LOG: promptLog, FAKE_ACP_MCP_LIST_LOG: toolLog,
       OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS: "512",
+      OPENCODE_ANTIGRAVITY_MODELS_DEV: "0",
     },
   });
   const timeout = setTimeout(() => child.kill("SIGKILL"), 12_000);
