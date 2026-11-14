@@ -1,10 +1,11 @@
+import { ignoreTemperature } from "./anthropic-http.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
 import type { HostTool } from "./host-tools.js";
 import {
   collectServiceTurn, isObject, MAX_CLIENT_TOOLS, parseMessage, toolJson as json,
   type ClientToolCall, type ClientToolResult, type ServiceContentBlock, type ServiceTurnEvent,
 } from "./service-messages.js";
-import type { AnthropicFinishReason, AnthropicUsage } from "./translate.js";
+import type { AnthropicFinishReason, AnthropicUsage, OrderedSegment } from "./translate.js";
 
 type GeminiResultImage = { displayName?: string; image: Extract<ServiceContentBlock, { type: "image" }> };
 type GeminiFunctionResponse = { id: string; name: string; response: Record<string, unknown>; images?: GeminiResultImage[] };
@@ -16,7 +17,7 @@ function resultImageBlocks(images?: GeminiResultImage[]): ServiceContentBlock[] 
 }
 
 const REQUEST_FIELDS = new Set(["contents", "systemInstruction", "generationConfig", "tools", "toolConfig"]);
-const GENERATION_FIELDS = new Set(["maxOutputTokens", "candidateCount", "responseMimeType"]);
+const GENERATION_FIELDS = new Set(["maxOutputTokens", "temperature", "candidateCount", "responseMimeType"]);
 const TOOL_FIELDS = new Set(["name", "description", "parameters", "parametersJsonSchema"]);
 // OpenCode's @ai-sdk/google marks reasoning history parts with thought flags; ACP rebuilds history, so only text is kept.
 const TEXT_FIELDS = new Set(["text", "thought", "thoughtSignature"]);
@@ -204,8 +205,9 @@ export function parseGeminiContent(body: Record<string, unknown>, model: string,
   if (Object.keys(body).some(key => !REQUEST_FIELDS.has(key))) invalid("Unsupported GenerateContent request field");
   const { contents, systemInstruction, generationConfig = {} } = body;
   if (!isObject(generationConfig) || Object.keys(generationConfig).some(key => !GENERATION_FIELDS.has(key))) {
-    invalid("generationConfig supports only maxOutputTokens, candidateCount and responseMimeType");
+    invalid("generationConfig supports only maxOutputTokens, temperature, candidateCount and responseMimeType");
   }
+  ignoreTemperature(generationConfig.temperature);
   const { maxOutputTokens = 4096, candidateCount, responseMimeType } = generationConfig;
   if (candidateCount !== undefined && candidateCount !== 1) invalid("candidateCount must be 1");
   if (responseMimeType !== undefined && responseMimeType !== "text/plain") invalid("responseMimeType must be text/plain");
@@ -278,7 +280,12 @@ function usageMetadata(raw: unknown) {
   }
 }
 
-type GeminiPart = { text: string } | { functionCall: ClientToolCall };
+type GeminiPart = { text: string; thought?: true } | { functionCall: ClientToolCall };
+
+/** Reasoning stays a separate thought part in the original text/thinking order. */
+function outputParts(segments: OrderedSegment[]): GeminiPart[] {
+  return segments.map(segment => segment.kind === "thinking" ? { text: segment.text, thought: true } : { text: segment.text });
+}
 
 function response(modelVersion: string, parts?: GeminiPart[], reason?: AnthropicFinishReason, usage?: ReturnType<typeof usageMetadata>) {
   return {
@@ -294,11 +301,12 @@ function response(modelVersion: string, parts?: GeminiPart[], reason?: Anthropic
 
 export async function geminiJson(events: AsyncIterable<ServiceTurnEvent>, model: string): Promise<Response> {
   const result = await collectServiceTurn(events);
+  const parts = outputParts(result.segments);
   if (result.finishReason === "tool_use") {
     const calls = result.calls.map(functionCall => ({ functionCall }));
-    return Response.json(response(model, result.content ? [{ text: result.content }, ...calls] : calls, "end_turn"));
+    return Response.json(response(model, parts.length ? [...parts, ...calls] : calls, "end_turn"));
   }
-  return Response.json(response(model, [{ text: result.content }], result.finishReason, usageMetadata(result.rawUsage)));
+  return Response.json(response(model, parts.length ? parts : [{ text: "" }], result.finishReason, usageMetadata(result.rawUsage)));
 }
 
 function data(payload: object): string {
@@ -337,6 +345,7 @@ export function geminiStream(model: string) {
   return {
     start: () => [],
     text: (delta: string) => [data(response(model, [{ text: delta }]))],
+    reasoning: (delta: string) => [data(response(model, [{ text: delta, thought: true }]))],
     functions: (calls: ClientToolCall[]) => calls.map((functionCall, index) =>
       data(response(model, [{ functionCall }], index === calls.length - 1 ? "end_turn" : undefined))),
     finish: (reason: AnthropicFinishReason, _usage?: AnthropicUsage, rawUsage?: unknown) =>

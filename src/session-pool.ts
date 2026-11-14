@@ -16,7 +16,7 @@ import {
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AcpEvent } from "./acp-process.js";
 import { HarnessFailureGuard } from "./protocol.js";
-import { buildBoundedHistory, extractTextContent, messageContentToAcp, hostResultMessageToAcp, type HostMessage } from "./prompt.js";
+import { extractTextContent, historyReferenceBlocks, messageContentToAcp, hostResultMessageToAcp, quotedBlocks, type HostMessage } from "./prompt.js";
 import { canonical, extendsBoundary, fingerprints, type ConversationState } from "./coordinator.js";
 import { ownershipKey, sessionStore, type SessionRecord } from "./session-store.js";
 import { debug, info, warn } from "./log.js";
@@ -125,11 +125,14 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
   };
 }
 
-async function reconstructionBlocks(message: HostMessage, cwd: string, budget: MediaMaterializationBudget): Promise<ContentBlock[]> {
+async function reconstructionBlocks(message: HostMessage, cwd: string, budget: MediaMaterializationBudget, operative: boolean): Promise<ContentBlock[]> {
   if (message.role === "system") return [{ type: "text", text: `<instruction-update>\n${extractTextContent(message.content)}\n</instruction-update>` }];
   if (message.role === "user" && Array.isArray(message.content) && message.content.some((p: any) => p?.type === "tool_result")) return hostResultMessageToAcp(message, [cwd], budget);
-  if (message.role === "user" && (!Array.isArray(message.content) || message.content.every((p: any) => !["tool_result", "tool_use"].includes(p?.type)))) return messageContentToAcp(message.content, [cwd], budget);
-  return [{ type: "text", text: buildBoundedHistory([message], Number.MAX_SAFE_INTEGER) }];
+  if (message.role === "user" && (!Array.isArray(message.content) || message.content.every((p: any) => !["tool_result", "tool_use"].includes(p?.type)))) {
+    const blocks = await messageContentToAcp(message.content, [cwd], budget);
+    return operative ? blocks : quotedBlocks("user", blocks);
+  }
+  return historyReferenceBlocks(message, [cwd], budget);
 }
 
 export class SessionPool {
@@ -308,7 +311,10 @@ export class SessionPool {
         const prior = request.priorMessages ?? [];
         let queuedStart = 0;
         prior.forEach((message, index) => { if (message.role === "assistant") queuedStart = index + 1; });
-        for (const [index, message] of prior.entries()) groups.push({ message, blocks: await reconstructionBlocks(message, request.settings.cwd, mediaBudget), operative: message.role === "system" || (message.role === "user" && index >= queuedStart) });
+        for (const [index, message] of prior.entries()) {
+          const operative = message.role === "system" || (message.role === "user" && index >= queuedStart);
+          groups.push({ message, blocks: await reconstructionBlocks(message, request.settings.cwd, mediaBudget, operative), operative });
+        }
       }
       groups.push({ message: { role: "user" }, blocks: request.prompt, operative: true });
       prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
@@ -322,13 +328,13 @@ export class SessionPool {
       const groups: ReconstructionGroup[] = [];
       const mediaBudget = { remaining: Number.POSITIVE_INFINITY, signal: request.signal, inspect: true };
       for (const [index, message] of unseen.entries()) {
-        const blocks = await reconstructionBlocks(message, request.settings.cwd, mediaBudget);
-        groups.push({ blocks, message, operative: message.role === "system" || index === currentUserIndex || (message.role === "user" && index >= queuedStart) });
+        const operative = message.role === "system" || index === currentUserIndex || (message.role === "user" && index >= queuedStart);
+        const blocks = await reconstructionBlocks(message, request.settings.cwd, mediaBudget, operative);
+        groups.push({ blocks, message, operative });
       }
       prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
     }
     prompt = await materializeMedia(prompt, request.signal);
-    if (request.instructions) prompt.unshift({ type: "text", text: request.instructions });
     // The alternate path must enforce the same independent transport/context cap.
     validateMediaBlocks(prompt);
     blockBudget(request.settings.model, prompt, request.settings.outputBudget);

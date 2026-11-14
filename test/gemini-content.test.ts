@@ -25,6 +25,10 @@ test("Gemini requests map text, roles, system instructions and output budget", (
     ],
   });
   expect(parseGeminiContent({ contents }, model, false).maxTokens).toBe(4096);
+  expect(parseGeminiContent({ contents, generationConfig: { temperature: 0.3 } }, model, false).maxTokens).toBe(4096);
+  for (const temperature of ["hot", Number.NaN, {}]) {
+    expect(() => parseGeminiContent({ contents, generationConfig: { temperature } }, model, false)).toThrow("finite number");
+  }
 });
 
 test("Gemini accepts OpenCode thought and signature metadata as read-only assistant text", () => {
@@ -60,7 +64,6 @@ test("Gemini requests reject unsupported and malformed input", () => {
     { contents: [{ parts: [{ functionResponse: { name: "f", response: {} } }] }] },
     { contents: [{ parts: [{ text: "before results" }, { functionResponse: { id: "id", name: "f", response: {} } }] }] },
     { contents: [{ parts: [{ functionResponse: { id: "id", name: "f", response: {} } }] }], toolConfig: { functionCallingConfig: { mode: "NONE" } } },
-    { generationConfig: { temperature: 0 } },
     { generationConfig: { responseMimeType: "application/json" } },
     { generationConfig: { candidateCount: 2 } },
     { generationConfig: { maxOutputTokens: 0 } },

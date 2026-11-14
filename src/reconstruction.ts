@@ -39,7 +39,9 @@ export function reconstruct(groups: ReconstructionGroup[], instructions: string,
   groups.forEach((_, i) => { const root = find(i); const unit = units.get(root) ?? []; unit.push(i); units.set(root, unit); });
   const required = new Set<number>();
   for (const unit of units.values()) if (unit.some(i => groups[i].operative)) unit.forEach(i => required.add(i));
-  const fixed = [...(instructions ? [{ type: "text" as const, text: instructions }] : []), ...groups.flatMap((g, i) => required.has(i) ? g.blocks : [])];
+  // Instructions are emitted exactly once, ahead of the omission evidence.
+  const instructionBlocks: ContentBlock[] = instructions ? [{ type: "text", text: instructions }] : [];
+  const fixed = [...instructionBlocks, ...groups.flatMap((g, i) => required.has(i) ? g.blocks : [])];
   let media = validateMediaBlocks(fixed);
   const marker: ContentBlock = { type: "text", text: HISTORY_OMISSION.slice(0, historyLimit) };
   // Omission evidence is fixed overhead whenever optional material exists.
@@ -61,5 +63,5 @@ export function reconstruct(groups: ReconstructionGroup[], instructions: string,
     bytes -= cost; textBytes -= textCost; chars -= characters; media += mediaCost;
     unit.forEach(i => selected.add(i));
   }
-  return [...(omitted ? [marker] : []), ...groups.flatMap((group, i) => selected.has(i) ? group.blocks : [])];
+  return [...instructionBlocks, ...(omitted ? [marker] : []), ...groups.flatMap((group, i) => selected.has(i) ? group.blocks : [])];
 }

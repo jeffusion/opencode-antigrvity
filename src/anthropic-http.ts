@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DEFAULT_MAX_REQUEST_BYTES, DEFAULT_REQUEST_READ_TIMEOUT_MS, envNumber } from "./constants.js";
 import { AgyError, asAgyError, retryAfterSeconds } from "./errors.js";
+import { warn } from "./log.js";
 import type { AnthropicUsage } from "./translate.js";
 
 export type AnthropicMessageRequest = {
@@ -18,6 +19,20 @@ export type AnthropicMessageRequest = {
   metadata?: unknown;
   [key: string]: unknown;
 };
+
+let warnedTemperature = false;
+
+/** ACP owns generation sampling. Accept a finite temperature for client
+ * compatibility, never claim it takes effect, and warn about it once. */
+export function ignoreTemperature(value: unknown): void {
+  if (value === undefined) return;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new AgyError("invalid_request", "temperature must be a finite number");
+  }
+  if (warnedTemperature) return;
+  warnedTemperature = true;
+  warn("Ignoring temperature: generation sampling is owned by ACP", { reason: "unsupported_temperature" });
+}
 
 export async function readJson(
   request: Request,

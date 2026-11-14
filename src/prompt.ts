@@ -202,6 +202,32 @@ export async function messageContentToAcp(content: unknown, roots: string[] = []
   return blocks;
 }
 
+/** Text a history part contributes to a rebuilt prompt. Thinking keeps its body,
+ * never its signature; a legal redacted thinking block contributes nothing.
+ * Malformed known reasoning shapes are rejected; unknown parts are the caller's
+ * policy to keep or reject. */
+export function partText(part: unknown): string | undefined {
+  if (!part || typeof part !== "object" || Array.isArray(part)) return undefined;
+  const record = part as MessageContentPart;
+  if (record.type === "thinking") {
+    if (typeof record.thinking !== "string") {
+      throw new AgyError("invalid_request", "A thinking block must contain a string `thinking` field", { code: "agy_invalid_thinking_part" });
+    }
+    if (record.signature !== undefined && typeof record.signature !== "string") {
+      throw new AgyError("invalid_request", "A thinking block signature must be a string", { code: "agy_invalid_thinking_part" });
+    }
+    return record.thinking;
+  }
+  if (record.type === "redacted_thinking") {
+    if (typeof record.data !== "string") {
+      throw new AgyError("invalid_request", "A redacted_thinking block must contain a string `data` field", { code: "agy_invalid_redacted_thinking_part" });
+    }
+    return "";
+  }
+  if (record.type !== "text" && record.type !== "input_text") return undefined;
+  return typeof record.text === "string" ? record.text : undefined;
+}
+
 /** Extract text for metadata requests and bounded fallback context. */
 export function extractTextContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -211,8 +237,14 @@ export function extractTextContent(content: unknown): string {
     const record = part as MessageContentPart;
     if (record.type === "tool_use") return `[tool ${String(record.name)} ${String(record.id)}] ${JSON.stringify(record.input ?? {})}`;
     if (record.type === "tool_result") return `[tool result ${String(record.tool_use_id)}] ${extractTextContent(record.content)}`;
-    return record.type === "text" || record.type === "input_text" ? (typeof record.text === "string" ? record.text : "") : "";
+    return partText(record) ?? "";
   }).filter(Boolean).join("\n");
+}
+
+/** The single system-instruction envelope both entries send to ACP. */
+export function hostInstructions(system: unknown): string {
+  const text = extractTextContent(system);
+  return text.trim() ? `<instruction>\n${text}\n</instruction>` : "";
 }
 
 function validateMessage(message: HostMessage, index: number): string {
@@ -280,6 +312,43 @@ export async function hostResultMessageToAcp(message: HostMessage, roots: string
 export function quotedHostMessage(message: HostMessage): string {
   const text = [extractTextContent(message.content).trim(), message.tool_calls ? JSON.stringify(message.tool_calls) : "", message.tool_call_id ? `[tool result ${String(message.tool_call_id)}]` : ""].filter(Boolean).join("\n");
   return text ? `[${messageRole(message)}]\n${text}` : "";
+}
+
+/** Reference blocks for one already-parsed historical message. Both entries
+ * quote a role the same way; no second message representation is built. */
+export function quotedBlocks(role: string, blocks: ContentBlock[]): ContentBlock[] {
+  return [{ type: "text", text: `[${role}]` }, ...blocks];
+}
+
+/** Rebuild one historical host message as quoted context: media and reasoning
+ * keep their original positions, tool calls/results stay inert text. */
+export async function historyReferenceBlocks(message: HostMessage, roots: string[], budget: MediaMaterializationBudget): Promise<ContentBlock[]> {
+  const blocks: ContentBlock[] = [];
+  if (typeof message.content === "string") {
+    if (message.content) blocks.push({ type: "text", text: message.content });
+  } else if (Array.isArray(message.content)) {
+    let pending: MessageContentPart[] = [];
+    const flush = async () => {
+      if (!pending.length) return;
+      blocks.push(...await messageContentToAcp(pending, roots, budget));
+      pending = [];
+    };
+    for (const part of message.content) {
+      const type = part && typeof part === "object" && !Array.isArray(part) ? (part as MessageContentPart).type : undefined;
+      if (type === "thinking" || type === "redacted_thinking") {
+        await flush();
+        const text = partText(part);
+        if (text) blocks.push({ type: "text", text });
+      } else if (type === "tool_use" || type === "tool_result") {
+        await flush();
+        blocks.push({ type: "text", text: extractTextContent([part]) });
+      } else pending.push(part as MessageContentPart);
+    }
+    await flush();
+  }
+  if (message.tool_calls) blocks.push({ type: "text", text: JSON.stringify(message.tool_calls) });
+  if (message.tool_call_id) blocks.push({ type: "text", text: `[tool result ${String(message.tool_call_id)}]` });
+  return quotedBlocks(messageRole(message), blocks);
 }
 
 export function buildBoundedHistory(messages: HostMessage[], maxChars = historyCharacterLimit()): string {

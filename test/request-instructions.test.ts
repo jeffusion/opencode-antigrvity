@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { withAgentSystem } from "../src/request-instructions.js";
-import { hostInstructions } from "../src/host-tools.js";
+import { hostInstructions } from "../src/prompt.js";
 
 test("configured system replaces generated context without changing user/history/tools", async () => {
   const body = {

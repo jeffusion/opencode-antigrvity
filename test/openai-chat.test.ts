@@ -24,13 +24,17 @@ test("Chat Completions normalizes leading instructions and text history for the 
   });
   expect(parseChatCompletion(body).request.maxTokens).toBe(4096);
   expect(parseChatCompletion({ ...body, max_tokens: 22 }).request.maxTokens).toBe(22);
+  expect(parseChatCompletion({ ...body, temperature: 0.2 }).request.model).toBe("test");
+  for (const temperature of ["hot", Number.NaN, {}]) {
+    expect(() => parseChatCompletion({ ...body, temperature })).toThrow("finite number");
+  }
 });
 
 test("Chat Completions rejects unsupported controls and malformed nested input", () => {
   for (const overrides of [
     { tools: [{ type: "custom" }] }, { tool_choice: "required" }, { parallel_tool_calls: false },
     { tools: [{ type: "function", function: { name: "strict_tool", strict: true } }] },
-    { temperature: 1 }, { n: 2 }, { store: true }, { max_tokens: 10, max_completion_tokens: 10 },
+    { n: 2 }, { store: true }, { max_tokens: 10, max_completion_tokens: 10 },
     { max_completion_tokens: null }, { max_tokens: 0 }, { stream: "true" }, { stream_options: { include_usage: true } },
     { stream: true, stream_options: null }, { stream: true, stream_options: [] },
     { stream: true, stream_options: { include_usage: "true" } }, { stream: true, stream_options: { include_obfuscation: false } },

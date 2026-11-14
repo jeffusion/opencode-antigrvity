@@ -207,7 +207,8 @@ directory under `agy-api`, and the credential directory defaults to
   or use `"auto"`. The route supports one choice, JSON or SSE, and
   `stream_options={"include_usage": True}` with `stream=True` in Python.
   Either `max_completion_tokens` or `max_tokens` can supply an advisory
-  budget. Sampling controls and structured output are unsupported.
+   budget. A finite numeric `temperature` is accepted but ignored; other
+   sampling controls and structured output are unsupported.
 - Chat Completions accepts `tools` with `type: "function"` and a
   `function` definition. A call returns in `message.tool_calls` for JSON
   or `delta.tool_calls` for SSE with JSON-encoded `function.arguments` and
@@ -257,4 +258,11 @@ directory under `agy-api`, and the credential directory defaults to
 - All three protocols accept inline PNG, JPEG, WebP and GIF in message
   content. Each image can be up to 4 MiB decoded, with up to 8 MiB decoded
   across the request and a 12 MiB JSON body limit. System instructions use
-  text. The service rejects URL and file references, audio, video and documents.
+   text. The service rejects URL and file references, audio, video and documents.
+- All three protocols accept a finite numeric `temperature` (inside
+  `generationConfig` for Gemini), but it does not change ACP sampling.
+  Unsupported controls such as `top_p`, `top_k` and forced tool calls remain
+  rejected. Anthropic and Gemini return ACP thinking separately from answer
+  text in both JSON and SSE; historical readable thinking is accepted without
+  treating its signature as upstream authentication. See the
+  [shared prompt contract](prompt-contract.md#shared-plugin-and-service-rules).

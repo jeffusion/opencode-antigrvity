@@ -3,7 +3,7 @@ import { AsyncEventQueue } from "./acp-process.js";
 import { AgyAbortError, AgyBusyError, AgyError } from "./errors.js";
 import { sessionPool, type SessionPool, type SessionSettings, type SessionTurnRequest } from "./session-pool.js";
 import type { AcpEvent, ContextOccupancy } from "./protocol.js";
-import { extractTextContent, messageContentToAcp, normalizePrompt, type HostMessage } from "./prompt.js";
+import { hostInstructions, messageContentToAcp, normalizePrompt, type HostMessage } from "./prompt.js";
 import { envNumber, HOST_MCP_SERVER_NAME } from "./constants.js";
 import { sessionStore } from "./session-store.js";
 import { canonical, extendsBoundary, fingerprints } from "./coordinator.js";
@@ -79,11 +79,6 @@ export function hostResults(messages: unknown): Map<string, ToolResult> {
   // Aggregate admission belongs to the actual delivery, including pending
   // results and steering, not historical result inspection/recovery.
   return result;
-}
-
-export function hostInstructions(system: unknown): string {
-  const text = extractTextContent(system);
-  return text.trim() ? `<instruction>\n${text}\n</instruction>` : "";
 }
 
 // Reloaded modules must keep live MCP waiters and endpoint tokens together.

@@ -7,7 +7,7 @@ import { geminiJson, geminiStream, parseGeminiContent } from "../src/gemini-cont
 import { ClientToolTurn } from "../src/tool-turn.js";
 import { openAIErrorResponse, openAIJson, openAIStream } from "../src/openai-chat.js";
 import type { AcpEvent } from "../src/protocol.js";
-import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn, type ClientToolCall } from "../src/service-messages.js";
+import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn, type ClientToolCall, type ServiceTurnEvent } from "../src/service-messages.js";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 
 const request = { model: "test", max_tokens: 128, messages: [{ role: "user", content: "hello" }] };
@@ -44,7 +44,73 @@ test("Anthropic accepts text history and rejects server tools and unsupported me
       ...request.messages,
     ] })).toThrow();
   }
-  expect(() => parseMessage({ ...request, system: [image(imageData)] })).toThrow("Only text content blocks are supported");
+  expect(() => parseMessage({ ...request, system: [image(imageData)] })).toThrow("Only text and thinking content blocks are supported");
+});
+
+test("Anthropic accepts readable thinking history and rejects malformed reasoning", () => {
+  const parsed = parseMessage({ ...request, messages: [
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan", signature: "sig" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "call-1", name: "lookup", input: { q: "x" } },
+    ] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "result" }] },
+    { role: "user", content: [{ type: "text", text: "next" }] },
+  ] });
+  expect(parsed.history[0].toolIds).toEqual(["call-1"]);
+  expect(parsed.history[0].content).toEqual(expect.arrayContaining([
+    { type: "text", text: "plan" }, { type: "text", text: "answer" },
+  ]));
+  expect(parsed.history[1].content).toEqual(expect.arrayContaining([{ type: "text", text: "[function result call-1]" }]));
+  const mixed = parseMessage({ ...request, messages: [
+    { role: "assistant", content: [{ type: "thinking", thinking: "why" }, { type: "text", text: "see" }, image(imageData)] },
+    { role: "user", content: [{ type: "text", text: "img" }] },
+  ] });
+  expect(mixed.history[0].content).toEqual([
+    { type: "text", text: "why" }, { type: "text", text: "see" }, { type: "image", mimeType, data: imageData },
+  ]);
+  expect(mixed.history[1].content).toBe("img");
+  // Redacted reasoning is opaque: ignored as text, but its turn stays in history.
+  const redacted = parseMessage({ ...request, messages: [
+    { role: "assistant", content: [{ type: "redacted_thinking", data: "opaque" }] },
+    request.messages[0],
+  ] });
+  expect(redacted.history[0]).toEqual({ role: "assistant", content: "" });
+  expect(JSON.stringify(redacted.history)).not.toContain("opaque");
+  for (const part of [
+    { type: "thinking", signature: "sig" },
+    { type: "thinking", thinking: "x", signature: 7 },
+    { type: "thinking", thinking: "x", extra: true },
+    { type: "redacted_thinking", data: 7 },
+    { type: "reasoning", text: "guess" },
+  ]) {
+    expect(() => parseMessage({ ...request, messages: [{ role: "assistant", content: [part] }, request.messages[0]] })).toThrow();
+  }
+  // Reasoning stays assistant-only; input_text stays unsupported; ordinary empty turns stay invalid.
+  for (const content of [
+    [{ type: "thinking", thinking: "x" }],
+    [{ type: "thinking", thinking: "x" }, image(imageData)],
+  ]) {
+    expect(() => parseMessage({ ...request, messages: [{ role: "user", content }] })).toThrow("assistant history");
+  }
+  for (const content of [
+    [{ type: "input_text", text: "x" }],
+    [{ type: "input_text", text: "x" }, image(imageData)],
+  ]) {
+    expect(() => parseMessage({ ...request, messages: [{ role: "user", content }] })).toThrow();
+  }
+  for (const content of ["", [], [{ type: "text", text: "  " }]]) {
+    expect(() => parseMessage({ ...request, messages: [{ role: "assistant", content }, request.messages[0]] })).toThrow("nonempty");
+  }
+  expect(() => parseMessage({ ...request, messages: [{ role: "user", content: [{ type: "text", text: "  " }] }] })).toThrow("nonempty");
+});
+
+test("Anthropic accepts a finite temperature it cannot apply and still rejects other sampling", () => {
+  expect(parseMessage({ ...request, temperature: 0.5 }).model).toBe("test");
+  for (const temperature of ["hot", Number.NaN, {}]) {
+    expect(() => parseMessage({ ...request, temperature })).toThrow("finite number");
+  }
+  expect(() => parseMessage({ ...request, top_p: 0.5 })).toThrow("Unsupported");
 });
 
 test("the decoded image budget covers the whole conversation", () => {
@@ -101,7 +167,7 @@ test("Gemini and Anthropic send current and historical images to ACP for JSON an
     const acpImage = { type: "image", mimeType, data: imageData };
     expect(received).toEqual(Array.from({ length: 4 }, () => [
       { type: "text", text: "[user]" }, prefix, acpImage,
-      { type: "text", text: "[assistant]\nEarlier answer" }, acpImage,
+      { type: "text", text: "[assistant]" }, { type: "text", text: "Earlier answer" }, acpImage,
     ]));
   } finally {
     for (const [key, value] of previous) {
@@ -111,6 +177,72 @@ test("Gemini and Anthropic send current and historical images to ACP for JSON an
     compatibility.mockRestore();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Anthropic and Gemini send the wrapped system instruction exactly once to ACP", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agy-service-system-"));
+  const promptLog = join(directory, "prompts.jsonl");
+  const environment = { FAKE_ACP_PROMPT_LOG: promptLog, GEMINI_HOME: join(directory, "profile") };
+  const previous = Object.keys(environment).map(key => [key, process.env[key]] as const);
+  const compatibility = fixtureCompatibility();
+  const model = "fake-model-low";
+  try {
+    Object.assign(process.env, environment);
+    for (const gemini of [false, true]) {
+      const events = textTurn({
+        directory,
+        detection: { executable: join(import.meta.dir, "fixtures", "fake-acp.mjs"), args: [], platform: process.platform },
+        selected: { requestedModel: model, acpModel: model },
+        request: gemini
+          ? parseGeminiContent({ contents: [{ parts: [{ text: "hello" }] }], systemInstruction: { parts: [{ text: "SYS" }] } }, model, false)
+          : parseMessage({ ...request, model, system: "SYS" }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      await (gemini ? geminiJson : jsonMessage)(events, model);
+    }
+    const received = (await readFile(promptLog, "utf8")).trim().split("\n").map(line => JSON.parse(line).prompt);
+    for (const prompt of received) {
+      expect(prompt[0]).toEqual({ type: "text", text: "<instruction>\nSYS\n</instruction>" });
+      expect(JSON.stringify(prompt).split("SYS")).toHaveLength(2);
+    }
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    compatibility.mockRestore();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Anthropic and Gemini surface ACP reasoning separately from the answer", async () => {
+  const events = (): AcpEvent[] => [
+    { event: "update", sessionId: "s", update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "why" } } },
+    { event: "update", sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } } },
+    { event: "result", sessionId: "s", result: { stopReason: "end_turn" } },
+  ];
+  async function* turn(): AsyncGenerator<AcpEvent> { yield* events(); }
+  expect((await (await jsonMessage(turn(), "test")).json()).content).toEqual([
+    { type: "thinking", thinking: "why", signature: "agy-0" },
+    { type: "text", text: "answer" },
+  ]);
+  expect((await (await geminiJson(turn(), "test")).json()).candidates[0].content.parts).toEqual([
+    { text: "why", thought: true }, { text: "answer" },
+  ]);
+  const frames = async (generator: AsyncGenerator<ServiceTurnEvent>, model: string) => {
+    const controller = new AbortController();
+    const response = await streamTurn(generator, anthropicStream(model), controller.signal, () => controller.abort(), () => {});
+    return (await response.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+  };
+  const anthropicFrames = await frames(turn(), "test");
+  expect(anthropicFrames.filter(frame => frame.type === "content_block_start").map(frame => frame.content_block.type)).toEqual(["thinking", "text"]);
+  expect(anthropicFrames.filter(frame => frame.type === "content_block_delta").map(frame => frame.delta.type)).toEqual(["thinking_delta", "signature_delta", "text_delta"]);
+  expect(anthropicFrames.find(frame => frame.delta?.type === "signature_delta")?.delta.signature).toMatch(/^agy-msg_/);
+  const controller = new AbortController();
+  const geminiResponse = await streamTurn(turn(), geminiStream("test"), controller.signal, () => controller.abort(), () => {});
+  const geminiParts = (await geminiResponse.text()).trimEnd().split("\n\n").flatMap(frame =>
+    JSON.parse(frame.slice(6)).candidates?.[0]?.content?.parts ?? []);
+  expect(geminiParts).toEqual([{ text: "why", thought: true }, { text: "answer" }]);
 });
 
 test("Gemini advertises 29 tools over MCP, resumes parallel calls by ID, and returns the ACP answer", async () => {

@@ -66,6 +66,16 @@ test("strict base64 and exact individual/aggregate decoded boundaries", async ()
   expect(() => validateMediaBlocks(inspected.get("a")!.content as ContentBlock[])).toThrow("combined images");
 });
 
+test("instructions are emitted exactly once, ahead of history and omission evidence", () => {
+  const sent = reconstruct([group("OLD"), group("NOW", true)], "SYS", "fake-model-low", 100_000);
+  expect(sent[0]).toEqual({ type: "text", text: "SYS" });
+  expect(text(sent).split("SYS")).toHaveLength(2);
+  expect(reconstruct([group("NOW", true)], "", "fake-model-low", 100_000)).toEqual([{ type: "text", text: "NOW" }]);
+  const omission = reconstruct([group("X".repeat(20_558)), group("NOW", true)], "SYS", "unknownmodel", 100_000);
+  expect(omission[0]).toEqual({ type: "text", text: "SYS" });
+  expect(omission[1]).toEqual({ type: "text", text: HISTORY_OMISSION });
+});
+
 test("optional selection reserves the same headroom as final fixed admission", () => {
   const sent = reconstruct([group("X".repeat(20558)), group("NOW", true)], "", "unknownmodel", 100000);
   expect(text(sent)).toContain("NOW");

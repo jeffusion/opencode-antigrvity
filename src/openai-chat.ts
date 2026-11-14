@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { errorPayload } from "./anthropic-http.js";
+import { errorPayload, ignoreTemperature } from "./anthropic-http.js";
 import { AgyError } from "./errors.js";
 import {
   collectServiceTurn, isObject, MAX_CLIENT_TOOLS, MAX_TOOL_ARGUMENT_BYTES, parseMessage, sseTextChunks, toolJson,
@@ -7,7 +7,7 @@ import {
 } from "./service-messages.js";
 import type { AnthropicFinishReason, AnthropicUsage } from "./translate.js";
 
-const CHAT_FIELDS = new Set(["model", "messages", "max_completion_tokens", "max_tokens", "stream", "stream_options", "n", "store", "tools", "tool_choice", "parallel_tool_calls"]);
+const CHAT_FIELDS = new Set(["model", "messages", "max_completion_tokens", "max_tokens", "temperature", "stream", "stream_options", "n", "store", "tools", "tool_choice", "parallel_tool_calls"]);
 const FINISH_REASONS = {
   end_turn: "stop",
   stop_sequence: "stop",
@@ -78,6 +78,7 @@ export function parseChatCompletion(body: Record<string, unknown>) {
     if (!CHAT_FIELDS.has(key)) invalid("Unsupported Chat Completions request field");
   }
   const { model, messages, stream, stream_options, max_completion_tokens, max_tokens, n, store, tool_choice, parallel_tool_calls } = body;
+  ignoreTemperature(body.temperature);
   if (tool_choice !== undefined && tool_choice !== "auto" && tool_choice !== "none") invalid("tool_choice supports auto and none");
   if (parallel_tool_calls !== undefined && parallel_tool_calls !== true) invalid("Serial-only tool calling is unsupported");
   if (n !== undefined && n !== 1) invalid("n must be 1");
