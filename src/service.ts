@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -11,7 +11,8 @@ import { ModelCatalog } from "./model-catalog.js";
 import { refreshModelMetadata } from "./model-metadata.js";
 import { resolveAcpModelSelection } from "./models.js";
 import { openAIErrorResponse, openAIJson, openAIStream, parseChatCompletion } from "./openai-chat.js";
-import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn } from "./service-messages.js";
+import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn, type StreamEnd } from "./service-messages.js";
+import { requestStage, TimeoutSceneCollector, TurnDiagnostics } from "./service-diagnostics.js";
 import { ClientToolTurn, type ToolProtocol } from "./tool-turn.js";
 
 // 8 MiB of images expands to about 10.7 MiB in base64.
@@ -91,6 +92,8 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
   let metadataTimer: ReturnType<typeof setInterval> | undefined;
   let detection: Awaited<ReturnType<typeof ensureAcpServer>> | undefined;
   const catalog = new ModelCatalog(directory, { cache: false });
+  // One bounded timeout scene per service instance; the data root owns it.
+  const scene = new TimeoutSceneCollector(resolve(directory, ".."));
   const ready = () => !draining && detection && catalog.catalog.source === "acp" && catalog.catalog.models.length > 0 && !catalog.lastError;
 
   const server = Bun.serve({
@@ -106,12 +109,20 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
       const gemini = geminiList || generate !== null;
       if (!gemini && !list && !chat && !(request.method === "POST" && path === "/v1/messages")) return new Response("Not Found", { status: 404 });
       const fail = gemini ? geminiErrorResponse : chat ? openAIErrorResponse : errorResponse;
+      const requestId = randomUUID();
+      const requestStartedAt = performance.now();
+      const route = list ? "models" : geminiList ? "gemini-models" : generate ? "gemini-generate" : chat ? "chat" : "messages";
+      requestStage(requestId, "enter", { route });
+      const reject = (outcome: string, error: AgyError) => {
+        requestStage(requestId, "closed", { outcome, ms: Math.round(performance.now() - requestStartedAt) });
+        return fail(error);
+      };
 
       const authorization = request.headers.get("authorization");
       const googleKey = gemini ? request.headers.get("x-goog-api-key") : null;
       const key = googleKey ?? request.headers.get("x-api-key") ?? authorization?.match(/^Bearer (\S+)$/i)?.[1];
-      if (!key || !timingSafeEqual(digest(key), keyHash)) return fail(new AgyError("auth", "Invalid API key"));
-      if (!ready() || !detection) return fail(new AgyError("overload", "Antigravity is not ready"));
+      if (!key || !timingSafeEqual(digest(key), keyHash)) return reject("auth_rejected", new AgyError("auth", "Invalid API key"));
+      if (!ready() || !detection) return reject("not_ready", new AgyError("overload", "Antigravity is not ready"));
       if (list) {
         return Response.json({ object: "list", data: catalog.catalog.models.map(({ id }) => ({
           id, object: "model", created: Math.floor(catalog.catalog.discoveredAt / 1000), owned_by: "antigravity",
@@ -122,13 +133,20 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
           name: `models/${id}`, baseModelId: id, displayName: name, supportedGenerationMethods: ["generateContent"],
         })) });
       }
-      if (active.size >= MAX_IN_FLIGHT) return fail(new AgyError("overload", "The service is at its concurrency limit"));
+      if (active.size >= MAX_IN_FLIGHT) return reject("concurrency_limit", new AgyError("overload", "The service is at its concurrency limit"));
 
       const done = Promise.withResolvers<void>();
       let plainTurn = false;
+      let failureKind: string | undefined;
+      let streamEnd: StreamEnd | undefined;
       const settled = () => {
         if (plainTurn) workers--;
         active.delete(done.promise);
+        requestStage(requestId, "closed", {
+          outcome: failureKind !== undefined ? "failed" : streamEnd?.outcome ?? "complete",
+          reason: failureKind !== undefined ? failureKind : streamEnd?.reason,
+          ms: Math.round(performance.now() - requestStartedAt),
+        });
         done.resolve();
       };
       active.add(done.promise);
@@ -146,34 +164,56 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
         const { request: body, includeUsage } = chat
           ? parseChatCompletion(payload)
           : { request: generate ? parseGeminiContent(payload, modelId, generate[2] === "streamGenerateContent") : parseMessage(payload), includeUsage: false };
+        requestStage(requestId, "parsed", {
+          ms: Math.round(performance.now() - requestStartedAt),
+          tools: body.tools?.length,
+          results: body.responses?.length,
+          stream: body.stream ? 1 : 0,
+        });
         const selected = resolveAcpModelSelection(body.model, undefined, catalog.catalog);
         const model = selected.requestedModel;
         const turn = { directory, detection, selected, request: body };
         let tools: ClientToolTurn | undefined;
+        const plainTrace = new TurnDiagnostics(requestId);
         const { responses } = body;
         if (responses) {
           tools = [...toolTurns].find(turn => turn.protocol === protocol && turn.owns(responses[0].id));
-          if (!tools) throw new AgyError("invalid_request", "The tool call is unknown, expired, or already resumed");
+          if (!tools) {
+            // Never log the client-supplied call id itself.
+            requestStage(requestId, "lookup_rejected", { candidates: toolTurns.size, reason: "unknown_call" });
+            throw new AgyError("invalid_request", "The tool call is unknown, expired, or already resumed");
+          }
+          requestStage(requestId, "lookup_matched", { turn: tools.diagnostics?.turnId, candidates: toolTurns.size });
           signal.throwIfAborted();
-          tools.resume(protocol, model, responses, body.steering);
+          tools.resume(protocol, model, responses, body.steering, requestId);
+          requestStage(requestId, "resume_resolved", { turn: tools.diagnostics?.turnId, results: responses.length });
         } else {
           if (workers >= MAX_IN_FLIGHT) throw new AgyError("overload", "The service is at its concurrency limit");
           if (body.tools) {
-            const pending = new ClientToolTurn(turn, body.tools, protocol);
+            const trace = new TurnDiagnostics(requestId, scene);
+            const pending = new ClientToolTurn(turn, body.tools, protocol, undefined, trace);
             tools = pending;
             toolTurns.add(pending);
             void pending.done.then(() => { toolTurns.delete(pending); workers--; });
+            requestStage(requestId, "turn_created", { turn: trace.turnId, tools: body.tools.length });
           } else plainTurn = true;
           workers++;
         }
-        const events = tools ? tools.segment(signal) : textTurn({ ...turn, signal });
+        const events = tools ? tools.segment(signal) : textTurn({ ...turn, signal, diagnostics: plainTrace, mcp: {
+          // First ACP update is observed where it is enqueued, not in the
+          // consumer loop, which may be paused by downstream backpressure.
+          onActivity: () => plainTrace.noteAcpUpdate(),
+        } });
         if (!body.stream) return await (generate ? geminiJson : chat ? openAIJson : jsonMessage)(events, model);
         const frames = generate ? geminiStream(model) : chat ? openAIStream(model, includeUsage) : anthropicStream(model);
-        const response = await streamTurn(events, frames, signal, () => client.abort(), settled);
+        const response = await streamTurn(events, frames, signal, () => client.abort(), settled, end => { streamEnd = end; });
         streaming = true;
         return response;
       } catch (error) {
-        return fail(publicFailure(error, signal));
+        const failure = publicFailure(error, signal);
+        failureKind = failure.kind;
+        requestStage(requestId, "failed", { reason: failure.kind });
+        return fail(failure);
       } finally {
         if (!streaming) settled();
       }
@@ -195,7 +235,7 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
       ]);
       stop.abort(new AgyError("overload", "The service is shutting down"));
       if (!graceful) await server.stop(true);
-      await Promise.all([drained, ...[...toolTurns].map(turn => turn.close())]);
+      await Promise.all([drained, ...[...toolTurns].map(turn => turn.close(undefined, "service_stop"))]);
     } finally {
       clearTimeout(timer);
       await closed;

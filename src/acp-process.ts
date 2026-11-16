@@ -217,6 +217,49 @@ async function terminateProcess(child: ChildProcess, force = false): Promise<voi
   }
 }
 
+type ConfigOption = { id?: unknown; category?: unknown; currentValue?: unknown; options?: unknown };
+
+function modelConfigOption(configOptions: unknown): ConfigOption | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  return configOptions.find((option: ConfigOption) => option?.category === "model") ?? configOptions.find((option: ConfigOption) => option?.id === "model");
+}
+
+function effortConfigOption(configOptions: unknown): ConfigOption | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  return configOptions.find((option: ConfigOption) => option?.category === "thought_level") ??
+    configOptions.find((option: ConfigOption) => ["effort", "thinking_level", "thought_level", "reasoning_effort"].includes(String(option?.id)));
+}
+
+function configOptionValues(option: ConfigOption | undefined): string[] | undefined {
+  if (!option || !Array.isArray(option.options)) return undefined;
+  const values: string[] = [];
+  const walk = (list: unknown[]) => {
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object") continue;
+      const candidate = entry as { options?: unknown; value?: unknown };
+      if (Array.isArray(candidate.options)) walk(candidate.options);
+      else if (typeof candidate.value === "string" && candidate.value) values.push(candidate.value);
+    }
+  };
+  walk(option.options);
+  return values;
+}
+
+function configOptionSignature(values: string[]): string {
+  return [...new Set(values)].sort().join("\u0000");
+}
+
+/** Map a model picker read-back to an exact wire ID through the reviewed
+ * catalog only: a known family plus level must resolve to one advertised exact. */
+function mappedExactModel(catalog: AcpModelCatalog | undefined, option: ConfigOption | undefined, level: string | undefined): string | undefined {
+  const current = typeof option?.currentValue === "string" ? option.currentValue : undefined;
+  if (!current || !catalog) return undefined;
+  if (catalog.exactModels.some((model) => model.id === current)) return current;
+  if (level === undefined) return undefined;
+  const matches = catalog.exactModels.filter((model) => model.family === current && model.effort === level);
+  return matches.length === 1 ? matches[0].id : undefined;
+}
+
 export class AcpWorker {
   readonly options: AcpWorkerOptions;
   readonly executable: string;
@@ -234,6 +277,12 @@ export class AcpWorker {
   private turnWatchdog: TurnActivityWatchdog | null = null;
   private stderrDiagnostic = "";
   private actualModelValue?: string;
+  // True once a response carried the complete legacy models snapshot; only
+  // then can config-only pickers be judged against the exact wire-ID set.
+  private legacySnapshot = false;
+  // Most recently observed picker choices signature. A changed set triggers a
+  // full rediscovery; identical repeats only move the selection.
+  private lastChoices?: string;
   private executionActivity = false;
   private turnUpdateBytes = 0;
   private authenticationFailure?: AgyError;
@@ -254,16 +303,67 @@ export class AcpWorker {
   catalog: AcpModelCatalog | undefined;
 
   private recordModels(response: unknown): void {
-    if (response && typeof response === "object") {
-      const value = response as { configOptions?: Array<{ id?: string; category?: string; currentValue?: unknown }>; models?: { currentModelId?: unknown } };
-      const selector = value.configOptions?.find(option => option.category === "model" || option.id === "model");
-      const current = selector?.currentValue ?? value.models?.currentModelId;
-      if (typeof current === "string" && current) this.actualModelValue = current;
+    if (!response || typeof response !== "object") return;
+    const value = response as { configOptions?: unknown; models?: { availableModels?: unknown; currentModelId?: unknown } };
+    const version = this.initValue?.agentInfo?.version ?? null;
+    if (Array.isArray(value.models?.availableModels)) {
+      // Complete snapshot: exact wire IDs plus the grouped picker they pair with.
+      this.legacySnapshot = true;
+      const values = configOptionValues(modelConfigOption(value.configOptions));
+      this.lastChoices = values ? configOptionSignature(values) : undefined;
+      const catalog = catalogFromSession(response, this.executable, version);
+      if (!catalog) return;
+      this.catalog = catalog;
+      // Only a current id present in this exact set is an unambiguous actual.
+      const current = value.models?.currentModelId;
+      this.actualModelValue = typeof current === "string" && catalog.exactModels.some((model) => model.id === current) ? current : undefined;
+      emitAcpCatalog(this.options.catalogScope, catalog);
+      return;
     }
-    const catalog = catalogFromSession(response, this.executable, this.initValue?.agentInfo?.version ?? null);
-    if (!catalog) return;
-    this.catalog = catalog;
-    emitAcpCatalog(this.options.catalogScope, catalog);
+    const picker = modelConfigOption(value.configOptions);
+    if (!picker) return;
+    const values = configOptionValues(picker);
+    if (values === undefined) return;
+    const current = typeof picker.currentValue === "string" && picker.currentValue ? picker.currentValue : undefined;
+    if (values.length === 0) {
+      // An advertised empty picker is authoritative on both wire shapes.
+      this.lastChoices = undefined;
+      this.actualModelValue = undefined;
+      const catalog = catalogFromSession(response, this.executable, version);
+      if (!catalog) return;
+      this.catalog = catalog;
+      emitAcpCatalog(this.options.catalogScope, catalog);
+      return;
+    }
+    const signature = configOptionSignature(values);
+    if (!this.legacySnapshot) {
+      // Pre-1.5 server: the picker itself is the exact wire-ID directory.
+      const catalog = catalogFromSession(response, this.executable, version);
+      if (!catalog) return;
+      this.catalog = catalog;
+      this.lastChoices = signature;
+      // Only an advertised concrete picker value is an unambiguous actual.
+      this.actualModelValue = current !== undefined && values.includes(current) ? current : undefined;
+      emitAcpCatalog(this.options.catalogScope, catalog);
+      return;
+    }
+    const exactIds = new Set(this.catalog?.exactModels.map((model) => model.id) ?? []);
+    this.actualModelValue = current !== undefined && exactIds.has(current) ? current : undefined;
+    if (values.every((entry) => exactIds.has(entry))) {
+      this.lastChoices = signature;
+      const catalog = catalogFromSession(response, this.executable, version);
+      if (!catalog) return;
+      this.catalog = catalog;
+      emitAcpCatalog(this.options.catalogScope, catalog);
+      return;
+    }
+    // Grouped family values are not exact wire IDs; never invent them. Every
+    // effective choice-set change (A -> B -> A included) triggers one full
+    // rediscovery; identical repeats only update selection.
+    if (signature !== this.lastChoices) {
+      this.lastChoices = signature;
+      emitAcpCatalog(this.options.catalogScope, undefined);
+    }
   }
 
   async start(signal?: AbortSignal): Promise<void> {
@@ -366,18 +466,34 @@ export class AcpWorker {
       throw new AgyError("unsupported", "This ACP server lists models but does not expose session model configuration", { code: "agy_acp_model_selection" });
     }
     if (!Array.isArray(configOptions)) return;
-    const options = configOptions as Array<{ id?: unknown; category?: unknown; options?: Array<{ value?: unknown }>; currentValue?: unknown }>;
-    const desired: Array<{ ids: string[]; value: string | undefined }> = [
+    let options = configOptions as ConfigOption[];
+    // The concrete wire ID already encodes this effort level; writing the
+    // picker again could switch the server to a nearest-level sibling.
+    const selectedExact = this.options.model ? this.catalog?.exactModels.find((entry) => entry.id === this.options.model) : undefined;
+    const effortEncoded = Boolean(this.options.effort && selectedExact?.effort === this.options.effort);
+    const desired: Array<{ ids: string[]; category?: string; value: string | undefined }> = [
       { ids: ["model"], value: this.options.model },
-      { ids: ["effort", "thought_level", "reasoning_effort"], value: this.options.effort },
+      { ids: ["effort", "thinking_level", "thought_level", "reasoning_effort"], category: "thought_level", value: effortEncoded ? undefined : this.options.effort },
       { ids: ["mode"], value: this.options.mode === "accept-edits" ? "auto_edit" : this.options.mode === "plan" ? "default" : this.options.mode },
     ];
     for (const item of desired) {
       if (!item.value) continue;
-      const option = options.find((candidate) => item.ids.includes(String(candidate.id)) || item.ids[0] === "model" && candidate.category === "model");
-      if (!option) continue;
-      const values = item.ids[0] === "model" && this.catalog ? this.catalog.exactModels.map((model) => model.id)
-        : Array.isArray(option.options) ? option.options.map((entry) => String(entry.value)) : [];
+      const isModel = item.ids[0] === "model";
+      const isEffort = item.ids[0] === "effort";
+      const option = options.find((candidate) =>
+        item.ids.includes(String(candidate.id)) ||
+        (isModel && candidate.category === "model") ||
+        (item.category !== undefined && candidate.category === item.category));
+      if (!option) {
+        // An explicitly requested, non-encoded effort has no picker: silently
+        // writing nothing would misreport the executed effort.
+        if (isEffort && !effortEncoded && options.length > 0) {
+          throw new AgyError("unsupported", `The ACP session exposes no thinking-level picker for effort "${item.value}"`, { code: "agy_acp_effort_unsupported" });
+        }
+        continue;
+      }
+      const values = isModel && this.catalog ? this.catalog.exactModels.map((model) => model.id)
+        : Array.isArray(option.options) ? option.options.map((entry) => String((entry as { value?: unknown }).value)) : [];
       const value = values.length
         ? values.find((entry) => entry === item.value)
         : item.value;
@@ -387,13 +503,45 @@ export class AcpWorker {
           details: { configId: String(option.id), available: values },
         });
       }
-      if (item.ids[0] === "model") this.actualModelValue = undefined;
+      // Stale actuals must never survive a model or effort write.
+      if (isModel || isEffort) this.actualModelValue = undefined;
       const updated = await this.withSignal(agent.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionIdValue,
         configId: String(option.id),
         value,
       }), signal);
       this.recordModels(updated);
+      // set_config_option returns the whole, updated option set. Validation
+      // may only read this response: an empty list carries no state, and the
+      // startup options can hold stale selection. They are kept only so later
+      // pickers still work with legacy servers that answer with [].
+      const fresh = updated && typeof updated === "object" ? (updated as { configOptions?: unknown }).configOptions : undefined;
+      const freshOptions = Array.isArray(fresh) && fresh.length ? fresh as ConfigOption[] : undefined;
+      const readback = freshOptions ? effortConfigOption(freshOptions)?.currentValue : undefined;
+      const readbackLevel = typeof readback === "string" ? readback : undefined;
+      if (isModel) {
+        if (this.actualModelValue !== undefined && this.actualModelValue !== value) {
+          // A family read-back is uncertain and silently undefined; a concrete
+          // read-back that disagrees with the request is a real mismatch.
+          throw new AgyError("protocol", `The ACP session reported model "${this.actualModelValue}" after selecting "${value}"`, { code: "agy_acp_model_mismatch" });
+        }
+        // The requested concrete descriptor already fixes the level; this
+        // response must agree whether or not an explicit setter follows.
+        if (selectedExact?.effort && readbackLevel !== undefined && readbackLevel !== selectedExact.effort) {
+          throw new AgyError("protocol", `The ACP session reported effort "${readbackLevel}" after selecting "${value}"`, { code: "agy_acp_effort_mismatch" });
+        }
+        // A grouped family read-back is verifiable only through the catalog:
+        // a unique family+level maps to one exact wire ID, so another family
+        // at the same level is a contradiction, not an unknown selection.
+        const selected = mappedExactModel(this.catalog, modelConfigOption(freshOptions), readbackLevel);
+        if (selected !== undefined && selected !== value) {
+          throw new AgyError("protocol", `The ACP session selected "${selected}" after requesting "${value}"`, { code: "agy_acp_model_mismatch" });
+        }
+      }
+      if (isEffort && readbackLevel !== undefined && readbackLevel !== value) {
+        throw new AgyError("protocol", `The ACP session reported effort "${readbackLevel}" after selecting "${value}"`, { code: "agy_acp_effort_mismatch" });
+      }
+      options = freshOptions ?? options;
     }
   }
 
@@ -407,7 +555,9 @@ export class AcpWorker {
       }
     }
     if (params.sessionId === this.sessionIdValue && params.update.sessionUpdate === "config_option_update") {
-      this.recordModels(params.update);
+      // During startup the session/new|load snapshot is the first complete
+      // state; a UI notification must not invent a catalog before it lands.
+      if (this.stateValue !== "starting") this.recordModels(params.update);
     }
     if (!this.sessionIdValue || params.sessionId !== this.sessionIdValue || !this.turnEvents) return;
     // A turn may legitimately run for longer than the setup/RPC timeout. Only

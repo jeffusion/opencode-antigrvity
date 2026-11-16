@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { AgyProcessError } from "./errors.js";
-import { installAcpServer } from "./acp-install.js";
+import { ACP_VERSION, installAcpServer } from "./acp-install.js";
 
 export type AcpServerDetection = {
   executable: string;
@@ -64,10 +64,12 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
   const home = options.home ?? homedir();
   const pathEntries = (options.path ?? process.env.PATH ?? "").split(delimiter).filter(Boolean);
   const dataHome = process.env.XDG_DATA_HOME?.trim() || join(home, ".local", "share");
+  const managed = join(dataHome, "opencode-antigravity", `acp-server-${ACP_VERSION}`);
+  const companion = process.platform === "win32" ? "localharness_external.exe" : "localharness_external";
   const candidates = [
     ...pathEntries.flatMap((entry) => names.map((name) => join(entry, name))),
     ...names.flatMap((name) => [
-      join(dataHome, "opencode-antigravity", "acp-server-1.3.0", name),
+      join(managed, name),
       join(dataHome, "opencode-antigravity", name),
       join(home, ".local", "bin", name),
       join(home, ".local", "share", "antigravity", name),
@@ -78,8 +80,7 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
     if (await isExecutable(candidate)) {
-      if (dirname(candidate) === join(dataHome, "opencode-antigravity", "acp-server-1.3.0") &&
-          !await isExecutable(join(dirname(candidate), process.platform === "win32" ? "localharness_external.exe" : "localharness_external"))) continue;
+      if (dirname(candidate) === managed && !await isExecutable(join(dirname(candidate), companion))) continue;
       return candidate;
     }
   }

@@ -25,7 +25,11 @@ details. A custom HOME or GEMINI_HOME remains file-only. It never creates a
 CLI token file, starts login, enumerates credentials, or writes the keyring.
 Native CI uses synthetic credentials on a disposable GitHub runner only.
 
-# macOS ARM64 isolation review
+# macOS ARM64 isolation review (ACP 1.3.0)
+
+This historical review covers 1.3.0. See the current
+[ACP release pin and isolation review](development.md#acp-release-pin-and-isolation)
+for the 1.5.0 upgrade.
 
 Downloaded the official ACP 1.3.0 Darwin ARM64 archive and independently
 verified both profile SHA-256 values. Extracted ZIP local entries from the

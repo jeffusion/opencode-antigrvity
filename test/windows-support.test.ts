@@ -16,7 +16,7 @@ test("Windows distribution requires the matching .exe companion and rejects unkn
   try {
     const distribution = acpDistribution("win32", "x64");
     expect(distribution.companion).toBe("localharness_external.exe");
-    expect(distribution.url).toBe("https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.3.0-windows-x86_64.zip");
+    expect(distribution.url).toBe("https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.0-windows-x86_64.zip");
     const executable = join(root, distribution.executable);
     await writeFile(executable, "unreviewed ACP");
     await writeFile(join(root, distribution.companion), "unreviewed companion");

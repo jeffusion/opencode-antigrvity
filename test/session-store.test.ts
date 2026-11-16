@@ -1,8 +1,16 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
-import { SessionStore } from "../src/session-store.js";
+import { describe, expect, spyOn, test } from "bun:test";
+import { SessionStore, validResponse } from "../src/session-store.js";
+
+const DAY_MS = 24 * 60 * 60_000;
+
+async function receiptFile(directory: string): Promise<string> {
+  const [identity] = await readdir(join(directory, "requests"));
+  const [file] = await readdir(join(directory, "requests", identity));
+  return join(directory, "requests", identity, file);
+}
 
 describe("non-secret session persistence", () => {
   test("defaults to the opencode-antigravity directory under XDG_DATA_HOME", async () => {
@@ -119,4 +127,120 @@ test("pruning preserves sessions locked by another owner", async () => {
   } finally { await unlock(); }
   await store.prune(0);
   expect(await store.get("active")).toBeUndefined();
+});
+
+describe("receipt read-modify-write locking", () => {
+  test("receipt reads, expiry pruning and saves share one receipt lock", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-shared-lock-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    await store.saveReceipt("session", "request", { state: "completed", events: [] });
+    const keys: string[] = [];
+    const lockTurn = store.lockTurn.bind(store);
+    spyOn(store, "lockTurn").mockImplementation(async (key: string, waitMs?: number) => {
+      keys.push(key);
+      return lockTurn(key, waitMs);
+    });
+    await store.receipt("session", "request");
+    await store.pruneCompletedPayloads(Date.now() + 8 * DAY_MS);
+    await store.saveReceipt("session", "request", { state: "running" });
+    const locks = keys.filter(key => key.startsWith("receipt:"));
+    expect(locks.length).toBe(3);
+    expect(new Set(locks).size).toBe(1);
+  });
+
+  test("expiry takes the owner lock first and releases the receipt lock first", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-lock-order-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    await store.saveReceipt("session", "request", { state: "completed", events: [] });
+    const order: string[] = [];
+    const lockTurn = store.lockTurn.bind(store);
+    spyOn(store, "lockTurn").mockImplementation(async (key: string, waitMs?: number) => {
+      const release = await lockTurn(key, waitMs);
+      const name = key.startsWith("receipt:") ? "receipt" : "owner";
+      order.push(`+${name}`);
+      return async () => { order.push(`-${name}`); await release(); };
+    });
+    await store.pruneCompletedPayloads(Date.now() + 8 * DAY_MS);
+    expect(order).toEqual(["+owner", "+receipt", "-receipt", "-owner"]);
+  });
+
+  test("expiry running concurrently with a save cannot erase the newer slice", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-race-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    // Discover the receipt lock through the real method, then hold it as a
+    // barrier so expiry and the new save genuinely overlap on disk.
+    const keys: string[] = [];
+    const lockTurn = store.lockTurn.bind(store);
+    spyOn(store, "lockTurn").mockImplementation(async (key: string, waitMs?: number) => {
+      const release = await lockTurn(key, waitMs);
+      keys.push(key);
+      return release;
+    });
+    await store.saveReceipt("session", "request", { state: "completed", events: [{ type: "agent_message_chunk" } as never], response: { digest: "old", state: "running" } });
+    const receiptLock = keys.find(key => key.startsWith("receipt:"))!;
+    const unlock = await new SessionStore().lockTurn(receiptLock, 5000);
+    const events = [{ type: "agent_message_chunk", text: "new" }] as never[];
+    let settled = 0;
+    const pruning = store.pruneCompletedPayloads(Date.now() + 8 * DAY_MS).then(() => { settled += 1; });
+    const saving = store.saveReceipt("session", "request", { state: "running", response: { digest: "new", state: "running", events } }).then(() => { settled += 1; });
+    await Bun.sleep(30);
+    // Both queue behind the same lock; an unlocked expiry would have finished.
+    expect(settled).toBe(0);
+    await unlock();
+    await Promise.all([pruning, saving]);
+    expect(await store.receipt("session", "request")).toMatchObject({ state: "running", response: { digest: "new", state: "running" } });
+    expect((await store.receipt("session", "request"))?.response?.events).toEqual(events);
+  });
+
+  test("a receipt with an invalid response slice fails closed and leaves a tombstone", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-bad-response-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    await store.saveReceipt("session", "request", { state: "running" });
+    const path = await receiptFile(directory);
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    raw.response = { digest: "d", state: "nonsense" };
+    await writeFile(path, JSON.stringify(raw));
+    expect(validResponse(raw.response)).toBe(false);
+    expect(validResponse({ digest: "d", state: "running", events: [] })).toBe(true);
+    await expect(store.receipt("session", "request")).rejects.toThrow("Invalid request receipt");
+    const stored = await store.receipt("session", "request");
+    expect(stored).toMatchObject({ state: "uncertain" });
+    expect(stored?.response).toBeUndefined();
+  });
+
+  test("saveReceipt refuses to overwrite a receipt it could not read", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-unreadable-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    await store.saveReceipt("session", "request", { state: "running" });
+    const path = await receiptFile(directory);
+    await writeFile(path, "{not json");
+    await expect(store.saveReceipt("session", "request", { state: "completed" })).rejects.toThrow();
+    expect(await readFile(path, "utf8")).toBe("{not json");
+    // A non-ENOENT read failure (here: a directory sits at the receipt path)
+    // must fail closed the same way instead of replacing the evidence.
+    await rm(path);
+    await mkdir(path);
+    await expect(store.saveReceipt("session", "request", { state: "completed" })).rejects.toThrow();
+    expect((await stat(path)).isDirectory()).toBe(true);
+  });
+
+  test("saving merges the stored slice and never persists an invalid response", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antigravity-receipt-merge-"));
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+    const store = new SessionStore();
+    await store.saveReceipt("session", "request", { state: "completed", response: { digest: "d", state: "running", events: [] } });
+    await store.saveReceipt("session", "request", { state: "parked" });
+    expect(await store.receipt("session", "request")).toMatchObject({ state: "parked", response: { digest: "d", state: "parked", events: [] } });
+    await store.saveReceipt("session", "request", { state: "running", response: { digest: "", state: "bogus" } as never });
+    expect(await store.receipt("session", "request")).toMatchObject({ state: "running", response: { digest: "d", state: "parked", events: [] } });
+    // Without a stored slice there is nothing to merge: the invalid one must
+    // not reach disk at all.
+    await store.saveReceipt("session", "fresh", { state: "running", response: { digest: "", state: "bogus" } as never });
+    expect((await store.receipt("session", "fresh"))?.response).toBeUndefined();
+  });
 });

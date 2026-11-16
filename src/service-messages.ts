@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { createAcpWorker, type AcpWorkerOptions } from "./acp-process.js";
+import type { TurnDiagnostics } from "./service-diagnostics.js";
 import type { AcpServerDetection } from "./acp-detect.js";
 import { anthropicUsage, completionId, errorPayload, ignoreTemperature, type AnthropicMessageRequest } from "./anthropic-http.js";
 import { mediaBytes, reserveMedia, type MediaMaterializationBudget } from "./attachments.js";
@@ -245,10 +246,11 @@ export type Turn = {
   selected: AcpModelSelection;
   request: ReturnType<typeof parseMessage>;
   signal: AbortSignal;
-  mcp?: Pick<AcpWorkerOptions, "mcpServers" | "waitingForTools">;
+  mcp?: Pick<AcpWorkerOptions, "mcpServers" | "waitingForTools" | "onActivity">;
+  diagnostics?: TurnDiagnostics;
 };
 
-export async function* textTurn({ directory, detection, selected, request, signal, mcp }: Turn): AsyncGenerator<AcpEvent> {
+export async function* textTurn({ directory, detection, selected, request, signal, mcp, diagnostics }: Turn): AsyncGenerator<AcpEvent> {
   const last = request.history.length - 1;
   const groups = request.history.map((message, index) => {
     const operative = index === last;
@@ -289,7 +291,13 @@ export async function* textTurn({ directory, detection, selected, request, signa
     }
   } finally {
     try { await worker?.stop(true); }
-    finally { await rm(workspace, { recursive: true, force: true }); }
+    finally {
+      // Only the stop attempt is awaited: a stop that throws still reaches
+      // this capture, so it proves "before cleanup", never "native tree fully
+      // stopped" or "state captured before cancel".
+      try { await diagnostics?.captureScene(workspace); }
+      finally { await rm(workspace, { recursive: true, force: true }); }
+    }
   }
 }
 
@@ -436,8 +444,13 @@ export function anthropicStream(model: string): StreamFrames {
   };
 }
 
+/** Explicit stream ending reported by streamTurn. It is recorded where the
+ * stream ends, never inferred from a signal that proactive cleanup aborted. */
+export type StreamEnd = { outcome: "complete" | "tool_wait" | "error" | "client_cancel"; reason?: string };
+
 export async function streamTurn(
   events: AsyncGenerator<ServiceTurnEvent>, frames: StreamFrames, signal: AbortSignal, cancel: () => void, settled: () => void,
+  onEnd?: (end: StreamEnd) => void,
 ): Promise<Response> {
   const first = await events.next();
   if (first.done) throw new AgyProtocolError("The ACP agent ended without a response");
@@ -475,6 +488,7 @@ export async function streamTurn(
       const heartbeat = ping && setInterval(() => {
         if (!signal.aborted && !waitingForReader && hasRoom(ping)) controller.enqueue(ping);
       }, DEFAULT_SSE_HEARTBEAT_MS);
+      let end: StreamEnd = { outcome: "error", reason: "internal" };
       void (async () => {
         try {
           let terminal: Extract<ReturnType<typeof mapAcpEvent>, { kind: "result" }> | undefined;
@@ -485,6 +499,7 @@ export async function streamTurn(
               await send(frames.functions(next.value.calls));
               if (!(await events.next()).done) throw new AgyProtocolError("Unexpected event after function calls");
               controller.close();
+              end = { outcome: "tool_wait" };
               return;
             }
             if (next.value.event === "function_calls") throw new AgyProtocolError("Unexpected function calls");
@@ -500,9 +515,13 @@ export async function streamTurn(
           if (!terminal) throw new AgyProtocolError("The ACP agent ended without a response");
           await send(frames.finish(terminal.finishReason, terminal.usage, terminal.result.usage));
           controller.close();
+          end = { outcome: "complete" };
         } catch (error) {
-          if (!cancelled) {
-            const frame = encoder.encode(frames.error(publicFailure(error, signal)));
+          if (cancelled) end = { outcome: "client_cancel" };
+          else {
+            const failure = publicFailure(error, signal);
+            end = { outcome: "error", reason: failure.kind };
+            const frame = encoder.encode(frames.error(failure));
             if (hasRoom(frame)) { controller.enqueue(frame); controller.close(); }
             else controller.error(new Error("The SSE response could not be delivered"));
           }
@@ -511,7 +530,7 @@ export async function streamTurn(
           signal.removeEventListener("abort", wake);
           cancel();
           try { await events.return(undefined); }
-          finally { settled(); }
+          finally { onEnd?.(end); settled(); }
         }
       })().catch(() => undefined);
     },

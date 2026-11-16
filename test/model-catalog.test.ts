@@ -84,3 +84,86 @@ test("an account switch during discovery cannot publish the previous account's r
     expect(manager.catalog.models).toEqual([]);
   } finally { finish(); await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a scope-matched invalidation forces full rediscovery and a stale scope does not", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-invalidate-"));
+  let calls = 0;
+  const manager = new ModelCatalog(directory, {
+    context: async () => ({ scope: "account", executable: "fake", args: [], cacheDirectory: directory }),
+    // The forced probe must surface a newer complete snapshot, not the old one.
+    probe: async () => {
+      calls++;
+      return acpModelCatalog("fake", "test", calls === 1 ? [["model", "Model"]] : [["model", "Model"], ["new-opaque-id", "New"]]);
+    },
+  });
+  try {
+    await manager.refresh();
+    expect(calls).toBe(1);
+    emitAcpCatalog("stale", undefined);
+    await manager.refresh();
+    expect(calls).toBe(1);
+    emitAcpCatalog("account", undefined);
+    await manager.refresh();
+    expect(calls).toBe(2);
+    expect(manager.catalog.exactModels.map((model) => model.id)).toEqual(["model", "new-opaque-id"]);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a force during an in-flight ordinary refresh still probes the fresh snapshot", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-force-"));
+  let calls = 0;
+  let release!: () => void;
+  let gate: Promise<void> | undefined;
+  const context = async (): Promise<CatalogContext> => {
+    if (gate) await gate;
+    return { scope: "account", executable: "fake", args: [], cacheDirectory: directory };
+  };
+  const manager = new ModelCatalog(directory, {
+    context,
+    probe: async () => {
+      calls++;
+      return acpModelCatalog("fake", "test", calls === 1 ? [["model", "Model"]] : [["model", "Model"], ["new-opaque-id", "New"]]);
+    },
+  });
+  try {
+    await manager.refresh();
+    expect(calls).toBe(1);
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const ordinary = manager.refresh();
+    emitAcpCatalog("account", undefined);
+    emitAcpCatalog("stale", undefined);
+    release();
+    // The caller waits for the queued forced probe, not just the first pass.
+    const result = await ordinary;
+    expect(calls).toBe(2);
+    expect(result.exactModels.map((model) => model.id)).toEqual(["model", "new-opaque-id"]);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("closing during a pending refresh and a late force spawns no probe", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-close-"));
+  let calls = 0;
+  let release!: () => void;
+  let gate: Promise<void> | undefined;
+  const context = async (): Promise<CatalogContext> => {
+    if (gate) await gate;
+    return { scope: "account", executable: "fake", args: [], cacheDirectory: directory };
+  };
+  const manager = new ModelCatalog(directory, {
+    context,
+    probe: async () => { calls++; return acpModelCatalog("fake", "test", [["model", "Model"]]); },
+  });
+  try {
+    await manager.refresh();
+    expect(calls).toBe(1);
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = manager.refresh();
+    emitAcpCatalog("account", undefined);
+    const closing = manager.close();
+    release();
+    await Promise.all([pending, closing]);
+    emitAcpCatalog("account", undefined);
+    await manager.refresh(true);
+    expect(calls).toBe(1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

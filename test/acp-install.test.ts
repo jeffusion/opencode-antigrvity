@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { zipSync, strToU8 } from "fflate";
-import { acpDistribution, installAcpServer, unpackAcpArchive } from "../src/acp-install.js";
+import { acpDistribution, ACP_VERSION, installAcpServer, unpackAcpArchive } from "../src/acp-install.js";
 
 test("first-use install extracts the pair once across concurrent requests and reuses it offline", async () => {
   const root = await mkdtemp(join(tmpdir(), "antigravity-install-"));
@@ -22,7 +22,7 @@ test("first-use install extracts the pair once across concurrent requests and re
     return new Response(archive);
   }) as typeof fetch;
   try {
-    const directory = join(root, "acp-server-1.3.0");
+    const directory = join(root, `acp-server-${ACP_VERSION}`);
     await mkdir(directory, { recursive: true });
     const dead = Bun.spawn([process.execPath, "--eval", ""], { stdout: "ignore", stderr: "ignore" });
     const deadPid = dead.pid;

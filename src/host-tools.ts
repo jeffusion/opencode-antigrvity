@@ -1,11 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { AsyncEventQueue } from "./acp-process.js";
 import { AgyAbortError, AgyBusyError, AgyError } from "./errors.js";
-import { sessionPool, type SessionPool, type SessionSettings, type SessionTurnRequest } from "./session-pool.js";
+import { contentIdentity, responseSliceEvents, sessionPool, turnIdentity, type SessionPool, type SessionSettings, type SessionTurnRequest } from "./session-pool.js";
+import { HarnessFailureGuard } from "./protocol.js";
 import type { AcpEvent, ContextOccupancy } from "./protocol.js";
 import { hostInstructions, messageContentToAcp, normalizePrompt, type HostMessage } from "./prompt.js";
 import { envNumber, HOST_MCP_SERVER_NAME } from "./constants.js";
-import { sessionStore } from "./session-store.js";
+import { sessionStore, toolResultDigest } from "./session-store.js";
 import { canonical, extendsBoundary, fingerprints } from "./coordinator.js";
 import { freezeContextOccupancy } from "./telemetry.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
@@ -155,14 +156,22 @@ export class HostBridge {
     return result;
   }
 
-  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL: string; requestId?: string; signal?: AbortSignal }): AsyncGenerator<BridgeEvent> {
+  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL: string; requestId?: string; signal?: AbortSignal; receipt?: { id: string; digest: string } }): AsyncGenerator<BridgeEvent> {
     if (this.closed) throw new AgyAbortError();
     if (this.consuming) throw new AgyBusyError("An OpenCode request is already consuming this turn");
     this.consuming = true;
     clearTimeout(this.idle);
     let parked = false;
     let finished = false;
-    const abort = () => { void this.close(); };
+    let frozen: { id: string; digest: string } | undefined;
+    let slice: AcpEvent[] = [];
+    let sliceBytes = 0;
+    let sliceCacheable = true;
+    let sliceSettled = true;
+    let initialDigest: string | undefined;
+    let ownsExecution = true;
+    let snapshotAttempted = false;
+    const abort = () => { if (ownsExecution) void this.close(); };
     input.signal?.addEventListener("abort", abort, { once: true });
     try {
       if (input.signal?.aborted) throw new AgyAbortError();
@@ -209,10 +218,65 @@ export class HostBridge {
       const tools = parseHostTools(input.tools);
       const signature = profile(tools, input.settings);
       const nextInstructions = hostInstructions(input.system);
+      // Unified operative admission: results and the current assistant group
+      // share one rule set, and result digests are checked before any cache
+      // read, ledger write or MCP release.
+      const operative = new Set<string>([...results.keys(), ...currentGroup]);
+      const origins = new Set<string>();
+      for (const id of operative) {
+        const saved = records.get(id);
+        if (!saved || saved.hostSessionID !== (this.sessionID ?? null)) throw new AgyError("invalid_request", "Operative tool call has no matching originating record", { code: "agy_request_origin_missing" });
+        if (typeof saved.requestId !== "string" || !saved.requestId) throw new AgyError("invalid_request", "Operative tool call has no originating request", { code: "agy_request_origin_missing" });
+        origins.add(saved.requestId);
+      }
+      if (origins.size > 1) throw new AgyError("invalid_request", "Continuation mixes multiple originating requests; cannot freeze one response identity", { code: "agy_request_origin_ambiguous" });
+      const resultStage = this.active
+        ? (rewritten || signature !== this.signature || nextInstructions !== this.instructions ? "profile-change" : "active-results")
+        : "inactive-trailing";
+      for (const [id, result] of results) toolResultDigest(records.get(id)!, id, result, resultStage);
+      // Only this turn's owner may admit an active continuation; cached calls
+      // never take ownership.
+      if (this.active && this.turn?.identity?.owned !== true) throw new AgyError("invalid_request", "The originating turn no longer owns this session; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
+      // Freeze this continuation's identity from the raw inbound content and
+      // the unique originating tool record, before any persistence or
+      // turn.messages rewrite. A MESSAGE_HEADER change cannot re-key it.
+      let frozenLocal = input.receipt;
+      const rawDigest = contentIdentity({ messages: messagesView as HostMessage[], instructions: nextInstructions, model: input.settings.model });
+      if (!frozenLocal && origins.size) {
+        const origin = [...origins][0];
+        frozenLocal = { id: `response:${createHash("sha256").update(`${origin}\u0000${rawDigest}\u0000${signature}`).digest("hex")}`, digest: rawDigest };
+      } else if (!frozenLocal) {
+        // The initial id needs the exact turn the Pool receives (normalized
+        // blocks/messages/prior), so only its raw digest is captured here.
+        initialDigest = rawDigest;
+      }
+      frozen = frozenLocal;
       if (this.active) {
         // Only this batch is operative. Admit its accumulated partial results
         // before persistence, not unrelated historical/settled result groups.
         validateMediaBlocks([...this.reported].flatMap(id => (results.get(id) ?? this.pending.get(id)?.result)?.content ?? []) as ContentBlock[]);
+      }
+      if (this.active) {
+        // Ownership and operative membership are checked before any cache read,
+        // ledger write or MCP release.
+        if (this.turn?.identity?.owned !== true) throw new AgyError("invalid_request", "The originating turn no longer owns this session; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
+        for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
+        if (frozen) {
+          const existing = await sessionStore.receipt(this.key, frozen.id);
+          if (existing) {
+            // A cached/rejected child owns no cleanup rights over the live
+            // native turn; only a real harness failure re-arms retirement.
+            ownsExecution = false;
+            const replay = responseSliceEvents(existing, frozen.digest);
+            try {
+              const guard = new HarnessFailureGuard();
+              for (const event of replay) guard.push(event);
+            } catch (error) { ownsExecution = true; throw error; }
+            yield* replay;
+            finished = true;
+            return;
+          }
+        }
       }
       if (this.active && (rewritten || signature !== this.signature || nextInstructions !== this.instructions)) {
         // Accept under the originating profile/instructions before retiring its waiter. The
@@ -221,7 +285,9 @@ export class HostBridge {
         for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result, "profile-change");
         if ([...this.reported].every(id => results.has(id) || this.pending.get(id)?.result)) {
           await this.close();
-          yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
+          const forwarded = { ...input, receipt: frozen };
+          frozen = undefined;
+          yield* hostBridge(this.key, this.sessionID, this.cwd).request(forwarded);
           finished = true;
           return;
         }
@@ -229,9 +295,9 @@ export class HostBridge {
       if (this.active) {
         // Validate the whole group before releasing any MCP handler.
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
+        for (const id of results.keys()) { const saved = records.get(id); if (!saved || typeof saved.requestId !== "string" || !saved.requestId) throw new AgyError("invalid_request", "Operative tool result has no originating request", { code: "agy_request_origin_missing" }); }
         for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result, "active-results");
         for (const [id, result] of results) { const pending = this.pending.get(id); if (pending) pending.result = result; }
-        if (this.turn?.responseCursor) this.turn.responseCursor.start = this.turn.responseCursor.events;
         if (this.reported.size && [...this.reported].every((id) => this.pending.get(id)?.result)) {
           // Instruction/profile changes rebuild above. Deliver user steering
           // alongside the original tool results on an unchanged parked turn.
@@ -255,13 +321,26 @@ export class HostBridge {
           // Result images re-enter natively instead of being offloaded by MCP.
           if (delivery.some((block) => block.type === "image")) {
             await this.close();
-            yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
+            const forwarded = { ...input, receipt: frozen };
+            frozen = undefined;
+            sliceSettled = true;
+            yield* hostBridge(this.key, this.sessionID, this.cwd).request(forwarded);
             finished = true;
             return;
           }
           const last = [...this.reported].at(-1);
           const requestID = this.turn?.identity?.value ?? this.turn?.requestId;
           if (requestID) await sessionStore.saveReceipt(this.key, requestID, { state: "running" });
+          // All admission passed: persist the frozen child before releasing
+          // any MCP waiter, so a crash cannot make it look unstarted.
+          if (frozen) {
+            if (this.turn?.identity?.owned !== true) throw new AgyError("invalid_request", "The originating turn no longer owns this session; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
+            await sessionStore.saveReceipt(this.key, frozen.id, { state: "submitted", response: { digest: frozen.digest, state: "running" } });
+            sliceSettled = false;
+          }
+          // Only a complete batch that is about to be released advances the
+          // terminal-translation cursor; partial results leave it untouched.
+          if (this.turn?.responseCursor) this.turn.responseCursor.start = this.turn.responseCursor.events;
           for (const id of this.reported) {
             const pending = this.pending.get(id)!;
             const result = structuredClone(pending.result!);
@@ -342,9 +421,14 @@ export class HostBridge {
           messages: normalized.messages, hostSessionID: this.sessionID,
           responseCursor: { start: 0, events: 0 },
           identity: {},
+          receipt: frozen,
           suppressToolTelemetry: true,
           priorMessages: normalized.priorMessages.filter((m) => m.role !== "system"), instructions: this.instructions, settings, signal: this.controller.signal };
         this.turn = turn;
+        if (!frozen) {
+          frozen = { id: turnIdentity(turn), digest: initialDigest! };
+          turn.receipt = frozen;
+        }
         this.acceptedBoundary = boundary;
         this.pumping = (async () => {
           try {
@@ -355,6 +439,10 @@ export class HostBridge {
       }
       if (this.reported.size) {
         parked = true;
+        if (frozen) {
+          await sessionStore.saveReceipt(this.key, frozen.id, { state: "parked", response: { digest: frozen.digest, state: "parked" } });
+          sliceSettled = true;
+        }
         // The original host batch is already exposed. Even a live MCP waiter
         // cannot prove its missing result means the host has not executed it.
         throw new AgyError("invalid_request", "The original host tool batch still has pending results. Deliver those results before continuing; previously exposed calls cannot be executed again automatically.", { code: "agy_tool_results_pending", retryable: false });
@@ -368,10 +456,17 @@ export class HostBridge {
           await new Promise((resolve) => setTimeout(resolve, 25));
           this.reported = new Set(this.pending.keys());
           parked = true;
+          if (frozen) {
+            await sessionStore.saveReceipt(this.key, frozen.id, { state: "parked", response: { digest: frozen.digest, state: "parked" } });
+            sliceSettled = true;
+          }
+          // Persistence can admit more calls; track exactly the batch exposed below.
+          const calls = [...this.pending.values()].filter(p => !p.result).map(p => p.call);
+          this.reported = new Set(calls.map(call => call.id));
           const contextOccupancy = freezeContextOccupancy(this.turn?.responseCursor?.contextOccupancy, this.now());
           yield {
             event: "host_tools",
-            calls: [...this.pending.values()].filter(p => !p.result).map((p) => p.call),
+            calls,
             ...(contextOccupancy ? { contextOccupancy } : {}),
           };
           return;
@@ -381,13 +476,41 @@ export class HostBridge {
         // replaying ACP tool telemetry as thinking would duplicate that UI.
         if (next.value.event === "update" &&
             (next.value.update.sessionUpdate === "tool_call" || next.value.update.sessionUpdate === "tool_call_update")) continue;
+        if (frozen) {
+          const bytes = Buffer.byteLength(JSON.stringify(next.value));
+          if (sliceCacheable && sliceBytes + bytes <= 2_000_000) { slice.push(next.value); sliceBytes += bytes; }
+          else { sliceCacheable = false; slice.length = 0; }
+        }
+        if (next.value.event === "result" && frozen && ownsExecution && this.turn?.identity?.value && next.value.result.stopReason === "end_turn") {
+          // Persist the complete successful slice (including the terminal)
+          // before the consumer can return; a failed write leaves the
+          // submitted tombstone and must not leak success.
+          snapshotAttempted = true;
+          sliceSettled = false;
+          await sessionStore.saveReceipt(this.key, frozen.id, {
+            state: "completed",
+            response: { digest: frozen.digest, state: "completed", ...(sliceCacheable ? { events: slice } : {}) },
+          });
+          sliceSettled = true;
+        }
         yield next.value;
         if (next.value.event === "result") { finished = true; this.active = false; await this.pumping; return; }
       }
     } finally {
       this.consuming = false;
       input.signal?.removeEventListener("abort", abort);
-      if (!parked && !finished) await this.close();
+      if (ownsExecution && frozen) {
+        try {
+          if (snapshotAttempted && !sliceSettled) {
+            // A completed snapshot that failed to commit must be demoted in the
+            // same receipt; the outer interrupted merge alone would keep it.
+            await sessionStore.saveReceipt(this.key, frozen.id, { state: "interrupted", response: { digest: frozen.digest, state: "running" } });
+          } else if (!sliceSettled) {
+            await sessionStore.saveReceipt(this.key, frozen.id, { state: "interrupted" });
+          }
+        } catch { /* the durable submitted/running receipt already blocks replay */ }
+      }
+      if (!parked && !finished && ownsExecution) await this.close();
       else if (!this.closed) this.idle = setTimeout(() => { void this.close(); }, envNumber("OPENCODE_ANTIGRAVITY_HOST_IDLE_MS", 2 * 60 * 60_000, 1000));
       this.idle?.unref?.();
     }

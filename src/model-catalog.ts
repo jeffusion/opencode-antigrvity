@@ -78,6 +78,7 @@ export class ModelCatalog {
   lastError: unknown;
   private context?: CatalogContext;
   private inFlight?: Promise<AcpModelCatalog>;
+  private forceRequested = false;
   private writes: Promise<void> = Promise.resolve();
   private controller = new AbortController();
   private closed = false;
@@ -87,7 +88,11 @@ export class ModelCatalog {
 
   constructor(private directory: string, private options: Options = {}) {
     this.unlisten = onAcpCatalog((scope, catalog) => {
-      if (!this.closed && scope === this.scope) this.adopt(catalog);
+      if (this.closed || scope !== this.scope) return;
+      // Real catalogs are adopted; a grouped-choice invalidation forces full
+      // rediscovery instead of letting a stale complete snapshot linger.
+      if (catalog) this.adopt(catalog);
+      else void this.refresh(true);
     });
   }
 
@@ -101,8 +106,27 @@ export class ModelCatalog {
 
   refresh(force = false): Promise<AcpModelCatalog> {
     if (this.closed) return Promise.resolve(this.catalog);
-    if (!this.inFlight) this.inFlight = this.refreshInternal(force).finally(() => { this.inFlight = undefined; });
+    if (force) this.forceRequested = true;
+    if (!this.inFlight) this.inFlight = this.drain();
     return this.inFlight;
+  }
+
+  /** Serializes refreshes; a force that arrived mid-flight gets its own probe
+   * after the current pass instead of being absorbed by an ordinary refresh. */
+  private async drain(): Promise<AcpModelCatalog> {
+    try {
+      while (!this.closed) {
+        const forced = this.forceRequested;
+        this.forceRequested = false;
+        await this.refreshInternal(forced);
+        if (!this.forceRequested) break;
+      }
+      return this.catalog;
+    } finally {
+      this.inFlight = undefined;
+      // A force set in the settle/finally window still gets its probe.
+      if (this.forceRequested && !this.closed) void this.refresh(true);
+    }
   }
 
   private async refreshInternal(force: boolean): Promise<AcpModelCatalog> {

@@ -7,7 +7,7 @@ import { geminiJson, geminiStream, parseGeminiContent } from "../src/gemini-cont
 import { ClientToolTurn } from "../src/tool-turn.js";
 import { openAIErrorResponse, openAIJson, openAIStream } from "../src/openai-chat.js";
 import type { AcpEvent } from "../src/protocol.js";
-import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn, type ClientToolCall, type ServiceTurnEvent } from "../src/service-messages.js";
+import { anthropicStream, jsonMessage, parseMessage, publicFailure, streamTurn, textTurn, type ClientToolCall, type ServiceTurnEvent, type StreamEnd } from "../src/service-messages.js";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 
 const request = { model: "test", max_tokens: 128, messages: [{ role: "user", content: "hello" }] };
@@ -405,6 +405,52 @@ test("cancelling an SSE response aborts a blocked turn before releasing its slot
   await settled.promise;
   expect(controller.signal.aborted).toBe(true);
   expect(cleaned).toBe(true);
+});
+
+test("streamTurn reports its explicit ending instead of inferring one from cleanup", async () => {
+  const run = async (events: (signal: AbortSignal) => AsyncGenerator<ServiceTurnEvent>, cancelAfterFirstFrame = false) => {
+    const controller = new AbortController();
+    const endings: StreamEnd[] = [];
+    const released = Promise.withResolvers<void>();
+    const response = await streamTurn(events(controller.signal), anthropicStream("test"), controller.signal,
+      () => controller.abort(), released.resolve, end => endings.push(end));
+    let body = "";
+    if (cancelAfterFirstFrame) {
+      const reader = response.body!.getReader();
+      body = new TextDecoder().decode((await reader.read()).value);
+      await reader.cancel();
+    } else body = await response.text();
+    await released.promise;
+    return { endings, body, aborted: controller.signal.aborted };
+  };
+
+  const complete = await run(async function* () {
+    yield text;
+    yield { event: "result", sessionId: "test", result: { stopReason: "end_turn" } };
+  });
+  expect(complete.endings).toEqual([{ outcome: "complete" }]);
+  // Cleanup aborts the signal even on success; the ending must not follow it.
+  expect(complete.aborted).toBe(true);
+
+  const toolWait = await run(async function* () {
+    yield { event: "function_calls", calls: [{ id: "call_1", name: "tool", args: {} }] };
+  });
+  expect(toolWait.endings).toEqual([{ outcome: "tool_wait" }]);
+
+  const failed = await run(async function* () {
+    yield text;
+    throw new Error("stream failure");
+  });
+  expect(failed.endings).toEqual([{ outcome: "error", reason: "internal" }]);
+  expect(failed.body).toContain("event: error");
+
+  const cancelled = await run((signal) => (async function* () {
+    yield text;
+    // Only the stream cancel aborts this turn, and it must be the ending.
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  })(), true);
+  expect(cancelled.endings).toEqual([{ outcome: "client_cancel" }]);
+  expect(cancelled.body).toContain("event: message_start");
 });
 
 test("a large ACP chunk streams losslessly through the bounded SSE buffer", async () => {

@@ -64,6 +64,53 @@ or tool response is emitted. Completed receipt replays retain their original
 response payload. A replacement execution cannot inherit the previous
 generation's occupancy.
 
+## Plugin response receipts
+
+HostBridge stores each HTTP response's own ACP event slice in the existing
+request receipt, not the whole native turn. Tool-result continuations derive
+their frozen identity from the originating request, original inbound content,
+and execution profile; changing the message header or omitting assistant call
+blocks must not bypass replay protection.
+
+Only a matching digest and a complete successful `end_turn` slice can replay.
+Replay does not rewrite the snapshot or renew its retention timestamp. A
+duplicate partial response keeps the original MCP waiter parked; it does not
+re-expose tool calls. Cancelled, interrupted, missing, or unavailable snapshots
+fail closed. Completed snapshots must persist before emitting success, and a
+failed commit must not leave a successful replay. Cached harness failures still
+retire the worker and disable session recovery.
+
+## ACP release pin and isolation
+
+The managed installer pins official ACP **1.5.0**, independently of the
+Antigravity CLI version. Release URLs and archive checksums come from the
+[official registry snapshot](https://github.com/agentclientprotocol/registry/blob/779f2602b93f592e911a085aac55dea7e1ce7ba3/antigravity-acp/agent.json).
+`src/acp-compatibility.ts` pins the separately reviewed server/native SHA-256
+pairs for Linux x64, macOS ARM64, and Windows x64; unknown pairs fail closed.
+
+The 1.5.0 review traced the empty `enabledTools` allowlist through the ACP
+filter, agent capabilities, and SDK tool configuration, including session
+load/resume and model-switch rebuilds. Unlike 1.3.0, there is no
+`safe_view_file` substitute: the allowlist must disable native `view_file`
+itself. The platform packages share the ACP Python sources; Windows packaged
+bytecode was also checked against those sources. This is not proof of
+authenticated inference on every operating system.
+
+Managed releases use separate versioned directories; upgrading does not
+overwrite the old pair. Explicit executable overrides and PATH entries retain
+priority, so an externally selected old or unreviewed pair is rejected rather
+than silently replaced. An ACP upgrade must update the pin, pair profiles,
+platform CI downloads/checksums, and relevant regression tests together.
+
+Changing the ACP executable also changes the catalog and tool-ledger scope.
+Finish pending host-tool round trips before switching versions; do not rewrite
+old ledger keys to bypass ownership checks during recovery.
+
+## 临时工具续接诊断
+
+阶段语义与敏感现场的使用边界见[工具续接诊断](tool-resume-diagnostics.md)。
+该分支的离线检查不构成生产故障修复或部署验收。
+
 ## Optional live tests
 
 The default suite uses fixtures and skips opt-in live and platform-specific

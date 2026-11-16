@@ -38,18 +38,50 @@ describe("ACP model catalog", () => {
 
 });
 
-test("ACP config options win over legacy models and preserve opaque wire IDs", () => {
+test("config-only pickers keep opaque wire IDs when no legacy snapshot exists", () => {
   const catalog = catalogFromSession({
     configOptions: [{ id: "choose", category: "model", currentValue: "gemini-pro-agent", options: [
       { group: "Gemini", options: [{ value: "gemini-pro-agent", name: "Gemini 3.1 Pro (High)" }, { value: "new-opaque-id", name: "New Model" }] },
     ] }],
-    models: { availableModels: [{ modelId: "must-not-appear", name: "Old" }] },
   }, "fake")!;
   expect(catalog.models.map((m) => m.id)).toEqual(["gemini-pro-agent", "new-opaque-id"]);
   expect(resolveAcpModelSelection(undefined, undefined, catalog).acpModel).toBe("gemini-pro-agent");
   expect(() => resolveAcpModelSelection("gemini-3.1-pro-high", undefined, catalog)).toThrow(/Unknown/);
   expect(() => resolveAcpModelSelection("gemini-pro-agent", "high", catalog)).toThrow(/did not advertise/);
   expect(buildProviderModels(catalog)[1].name).toContain("limits estimated");
+});
+
+test("the complete legacy models snapshot wins over grouped config pickers", () => {
+  const catalog = catalogFromSession({
+    configOptions: [{ id: "model", category: "model", currentValue: "gemini-3.8-flash", options: [
+      { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+      { value: "ui-only-family", name: "UI Family" },
+    ] }],
+    models: {
+      availableModels: [
+        { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+        { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+        { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
+        { modelId: "opaque-wire-id", name: "Opaque" },
+      ],
+      currentModelId: "gemini-3.8-flash-low",
+    },
+  }, "fake")!;
+  expect(catalog.exactModels.map((m) => m.id)).toEqual([
+    "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "opaque-wire-id",
+  ]);
+  expect(catalog.models.map((m) => m.id)).toEqual(["gemini-3.8-flash", "opaque-wire-id"]);
+  expect(catalog.currentModel).toBe("gemini-3.8-flash-low");
+  expect(resolveAcpModelSelection("gemini-3.8-flash", "medium", catalog).acpModel).toBe("gemini-3.8-flash-medium");
+});
+
+test("an advertised empty legacy snapshot clears without falling back to config pickers", () => {
+  const catalog = catalogFromSession({
+    models: { availableModels: [], currentModelId: "anything" },
+    configOptions: [{ id: "model", category: "model", currentValue: "ui-only", options: [{ value: "ui-only", name: "UI" }] }],
+  }, "fake")!;
+  expect(catalog.exactModels).toEqual([]);
+  expect(catalog.models).toEqual([]);
 });
 
 test("missing, empty, legacy, and colliding catalogs do not invent model availability", () => {
