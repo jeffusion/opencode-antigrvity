@@ -49,10 +49,12 @@ export class ClientToolTurn {
       hostname: "127.0.0.1", port: 0, idleTimeout: 0, maxRequestBodySize: MAX_MCP_BODY_BYTES,
       fetch: request => this.mcp(request),
     });
-    this.events = textTurn({ ...turn, signal: this.controller.signal, mcp: {
+    const mcp: NonNullable<Turn["mcp"]> = {
       mcpServers: [{ type: "http", name: HOST_MCP_SERVER_NAME, url: new URL(this.token, this.server.url).href, headers: [] }],
+      mcpToolNames: this.tools.length ? this.tools.map((tool) => tool.name) : undefined,
       waitingForTools: () => this.pending.size > 0,
-    } });
+    };
+    this.events = textTurn({ ...turn, signal: this.controller.signal, mcp });
   }
 
   readonly model: string;

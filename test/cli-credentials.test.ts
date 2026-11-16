@@ -4,7 +4,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { readWindowsCliCredential, resolveCliRefreshToken } from "../src/cli-credentials.js";
+import { readWindowsCliCredential, resolveCliCredential, resolveCliRefreshToken } from "../src/cli-credentials.js";
 import { requireCliAuthentication } from "../src/auth-bridge.js";
 import { effectiveAuth } from "../src/effective-auth.js";
 import { discoveryTimeoutMs } from "../src/model-catalog.js";
@@ -15,6 +15,22 @@ test("native discovery deadlines allow slow Windows cold start but stay bounded"
   expect(discoveryTimeoutMs("win32")).toBe(120_000);
   expect(discoveryTimeoutMs("linux")).toBe(45_000);
   expect(discoveryTimeoutMs("darwin")).toBe(45_000);
+});
+
+test("resolver returns the complete raw consumer envelope and stable refresh token", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agy-full-envelope-"));
+  const environment = { GEMINI_HOME: home };
+  const path = join(home, "antigravity-cli", "antigravity-oauth-token");
+  const complete = JSON.stringify({ auth_method: "oauth-personal", token: { access_token: "fixture-access", refresh_token: "fixture-refresh", expiry: "2099-01-01T00:00:00Z" }, extra: { keep: true } });
+  try {
+    await mkdir(join(home, "antigravity-cli"));
+    await writeFile(path, complete);
+    const credential = await resolveCliCredential(environment);
+    expect(credential).toEqual({ raw: complete, refreshToken: "fixture-refresh" });
+    expect(await resolveCliRefreshToken(environment)).toBe("fixture-refresh");
+    await writeFile(path, JSON.stringify({ auth_method: "consumer", token: {} }));
+    expect(await resolveCliCredential(environment)).toBeUndefined();
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
 test("file-backed auth scopes and gating follow account changes and signout", async () => {
@@ -112,7 +128,7 @@ if ($env:AGY_SYNTHETIC_FIXTURE) {
 }
 
 test.skipIf(process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true" || process.env.AGY_TEST_NATIVE_KEYRING !== "1")(
-  "native CredWrite/Read/Delete recognizes login, rotates scope/ACP token and rejects signout", async () => {
+  "native CredWrite/Read/Delete recognizes login, rotates scope and never writes an ACP token", async () => {
     const home = join(homedir(), ".gemini");
     const environment = { ...process.env, HOME: homedir(), GEMINI_HOME: home };
     expect(await readWindowsCliCredential(environment)).toBeUndefined();
@@ -130,7 +146,8 @@ test.skipIf(process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true
       expect(second.scope).not.toBe(first.scope);
       expect(second.scope).not.toContain("synthetic");
       await requireCliAuthentication(environment);
-      expect(JSON.parse(await readFile(join(home, "antigravity-acp/acp_token.json"), "utf8")).refresh_token).toBe("synthetic-second");
+      expect(await resolveCliRefreshToken(environment)).toBe("synthetic-second");
+      await expect(access(join(home, "antigravity-acp/acp_token.json"))).rejects.toThrow();
       await setNativeFixture(); written = false;
       expect(await readWindowsCliCredential(environment)).toBeUndefined();
       expect((await effectiveAuth(environment)).scope).not.toBe(second.scope);

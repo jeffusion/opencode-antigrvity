@@ -24,7 +24,7 @@ import { fixtureCompatibility } from "./fixtures/compatibility.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const environmentKeys = [
-  "OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME",
+  "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME",
   "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_PROMPT_LOG",
   "OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD", "FAKE_ACP_STATE_FILE",
 ] as const;
@@ -33,7 +33,6 @@ for (const key of environmentKeys) savedEnvironment.set(key, process.env[key]);
 
 const root = await mkdtemp(join(tmpdir(), "agy-entrypoint-parity-"));
 const promptLog = join(root, "prompts.jsonl");
-process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
 process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
 process.env.GEMINI_HOME = join(root, "gemini-home");
 process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";

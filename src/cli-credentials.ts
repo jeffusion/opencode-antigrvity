@@ -66,20 +66,29 @@ export async function readWindowsCliCredential(environment: NodeJS.ProcessEnv): 
   } catch { return undefined; }
 }
 
-function refreshToken(raw: string | undefined): string | undefined {
+/** The complete consumer credential envelope plus its stable account revision. */
+export type CliCredential = {
+  raw: string;
+  refreshToken: string;
+};
+
+function parseCredential(raw: string | undefined): CliCredential | undefined {
   try {
     const value: unknown = JSON.parse(raw || "");
     if (!value || typeof value !== "object" || !("token" in value)) return undefined;
     if ("auth_method" in value && value.auth_method && value.auth_method !== "consumer" && value.auth_method !== "oauth-personal") return undefined;
     const token = value.token;
     if (!token || typeof token !== "object" || !("refresh_token" in token)) return undefined;
-    return typeof token.refresh_token === "string" && token.refresh_token.trim() ? token.refresh_token : undefined;
+    const refreshToken = typeof token.refresh_token === "string" && token.refresh_token.trim() ? token.refresh_token : undefined;
+    return refreshToken && raw !== undefined ? { raw, refreshToken } : undefined;
   } catch { return undefined; }
 }
 
-/** Custom HOME/GEMINI_HOME must never borrow another home's OS login. */
-export async function resolveCliRefreshToken(environment: NodeJS.ProcessEnv = process.env,
-  options: { platform?: NodeJS.Platform; nativeHome?: string; readKeyring?: typeof readWindowsCliCredential } = {}): Promise<string | undefined> {
+/** Reads the full CLI consumer envelope. Custom HOME/GEMINI_HOME must never
+ * borrow another home's OS login. Windows keyring remains first only for the
+ * native default home; an existing keyring value never falls back to a file. */
+export async function resolveCliCredential(environment: NodeJS.ProcessEnv = process.env,
+  options: { platform?: NodeJS.Platform; nativeHome?: string; readKeyring?: typeof readWindowsCliCredential } = {}): Promise<CliCredential | undefined> {
   const nativeHome = options.nativeHome ?? homedir();
   const home = geminiHome(environment);
   const defaultHome = resolve(home) === resolve(join(nativeHome, ".gemini")) &&
@@ -87,8 +96,14 @@ export async function resolveCliRefreshToken(environment: NodeJS.ProcessEnv = pr
   if ((options.platform ?? process.platform) === "win32" && defaultHome) {
     const raw = await (options.readKeyring ?? readWindowsCliCredential)(environment);
     // An existing malformed/non-consumer credential is not a file-fallback login.
-    if (raw !== undefined) return refreshToken(raw);
+    if (raw !== undefined) return parseCredential(raw);
   }
-  try { return refreshToken(await readFile(join(home, "antigravity-cli", "antigravity-oauth-token"), "utf8")); }
+  try { return parseCredential(await readFile(join(home, "antigravity-cli", "antigravity-oauth-token"), "utf8")); }
   catch { return undefined; }
+}
+
+/** Existing callers only need the stable revision; keep this API unchanged. */
+export async function resolveCliRefreshToken(environment: NodeJS.ProcessEnv = process.env,
+  options: { platform?: NodeJS.Platform; nativeHome?: string; readKeyring?: typeof readWindowsCliCredential } = {}): Promise<string | undefined> {
+  return (await resolveCliCredential(environment, options))?.refreshToken;
 }

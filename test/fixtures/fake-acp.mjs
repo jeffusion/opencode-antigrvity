@@ -16,6 +16,76 @@ let mcpServers = [];
 const pending = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const MODEL15_FAMILY = "gemini-3.8-flash";
+const MODEL15_EXACT = [
+  ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
+  ["gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"],
+  ["gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"],
+  ["fake-model-low", "Fake Model"],
+];
+const model15State = { currentModelId: "gemini-3.8-flash-high", level: "high" };
+if (process.env.FAKE_ACP_MODEL_1_5_START_PLAIN) { model15State.currentModelId = "fake-model-low"; model15State.level = "low"; }
+const model15Extras = (process.env.FAKE_ACP_MODEL_1_5_EXTRA || "").split(",").filter(Boolean);
+// A second advertised grouped family, used to prove a same-level read-back
+// cannot be accepted when the catalog maps it to another concrete wire ID.
+const model15Alt = process.env.FAKE_ACP_MODEL_1_5_OTHER_FAMILY
+  ? [["alt-flash-high", "Alt Flash (High)"], ["alt-flash-low", "Alt Flash (Low)"]]
+  : [];
+
+function model15ModelOptions(exactPicker) {
+  if (exactPicker) return MODEL15_EXACT.concat(model15Extras.map((id) => [id, id]), model15Alt).map(([value, name]) => ({ value, name }));
+  return [
+    { value: MODEL15_FAMILY, name: "Gemini 3.8 Flash" },
+    { value: "fake-model-low", name: "Fake Model" },
+    ...(model15Alt.length ? [{ value: "alt-flash", name: "Alt Flash" }] : []),
+    ...model15Extras.map((id) => ({ value: id, name: id })),
+  ];
+}
+
+function model15Options() {
+  const exactPicker = Boolean(process.env.FAKE_ACP_MODEL_1_5_EXACT_PICKER);
+  const grouped = !exactPicker && model15State.currentModelId.startsWith(`${MODEL15_FAMILY}-`);
+  const options = [{
+    id: "model", category: "model", type: "select", name: "Model",
+    currentValue: exactPicker || !grouped ? model15State.currentModelId : MODEL15_FAMILY,
+    options: model15ModelOptions(exactPicker),
+  }];
+  if (grouped) options.push({
+    id: "thinking_level", category: "thought_level", type: "select", name: "Thinking Level",
+    currentValue: model15State.level,
+    options: [{ value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" }],
+  });
+  options.push({ id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }] });
+  return options;
+}
+
+function model15Session() {
+  return {
+    models: {
+      availableModels: MODEL15_EXACT.concat(model15Alt, model15Extras.map((id) => [id, id])).map(([modelId, name]) => ({ modelId, name })),
+      currentModelId: model15State.currentModelId,
+    },
+    configOptions: model15Options(),
+  };
+}
+
+function applyModel15(configId, value) {
+  const text = String(value);
+  if (configId === "thinking_level") {
+    model15State.level = text;
+    if (model15State.currentModelId.startsWith(`${MODEL15_FAMILY}-`)) model15State.currentModelId = `${MODEL15_FAMILY}-${text}`;
+    return;
+  }
+  if (configId !== "model") return;
+  if (text === MODEL15_FAMILY) {
+    model15State.currentModelId = `${MODEL15_FAMILY}-${model15State.level}`;
+    return;
+  }
+  model15State.currentModelId = text;
+  const level = text.match(/-(low|medium|high)$/);
+  if (level) model15State.level = level[1];
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -105,20 +175,27 @@ async function handlePrompt(message) {
     };
     const initialized = await rpc("initialize", { protocolVersion: "2025-03-26" });
     if (initialized.result?.serverInfo?.name !== mcpServers[0].name) { fail(id, -32603, "MCP server identity mismatch"); return; }
+    const list = await rpc("tools/list");
+    const name = list.result.tools[0].name;
+    if (process.env.FAKE_ACP_MCP_LIST_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_LIST_LOG, JSON.stringify(list.result.tools) + "\n");
     if (text.includes("FAKE_MCP_PERMISSION")) {
+      // Official CLI order and naming: a session tool_call notification with
+      // the machine name arrives before session/request_permission, whose
+      // toolCall carries the same machine name.
+      const toolCallId = "mcp-permission";
+      const machineName = `mcp_${mcpServers[0].name}_${name}`;
+      update({ sessionUpdate: "tool_call", toolCallId, name: machineName, title: "Execute external tool", kind: "execute", status: "pending" });
       const permission = await request("session/request_permission", {
         sessionId,
-        toolCall: { toolCallId: "mcp-permission", title: "Execute external tool", kind: "execute", status: "pending", _meta: { mcp: { server: mcpServers[0].name } } },
+        toolCall: { toolCallId, name: machineName, title: "Execute external tool", kind: "execute", status: "pending" },
         options: [
           { optionId: "allow", name: "Allow", kind: "allow_once" },
           { optionId: "deny", name: "Deny", kind: "reject_once" },
         ],
       });
       if (permission?.outcome?.optionId !== "allow") { fail(id, -32603, "MCP permission denied"); return; }
+      update({ sessionUpdate: "tool_call", toolCallId, name: machineName, title: "Execute external tool", kind: "execute", status: "completed" });
     }
-    const list = await rpc("tools/list");
-    const name = list.result.tools[0].name;
-    if (process.env.FAKE_ACP_MCP_LIST_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_LIST_LOG, JSON.stringify(list.result.tools) + "\n");
     if (text.includes("FAKE_MCP_USAGE_BEFORE")) update({ sessionUpdate: "usage_update", used: contextUsed(text), size: 1000 });
     if (text.includes("FAKE_MCP_ACTIVITY")) {
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "GENUINE_THOUGHT_BEFORE" } });
@@ -166,6 +243,42 @@ async function handlePrompt(message) {
   if (text.includes("FAKE_EXIT")) process.exit(1);
   if (text.includes("FAKE_AUTH_ERROR")) {
     fail(id, -32000, "authentication required");
+    activePrompt = undefined;
+    return;
+  }
+  if (text.includes("FAKE_TOOL_PERMISSION")) {
+    // Protocol-level permission cases shaped like official CLI 1.5.9: the
+    // session tool_call notification (machine name) precedes the request.
+    const server = mcpServers[0]?.name ?? "external_tool";
+    const machine = `mcp_${server}_read_file`;
+    const permissionCase = process.env.FAKE_ACP_PERMISSION_CASE || "allow";
+    const callId = permissionCase === "reuse-old-seen" ? "load-seen-call" : "policy-call-1";
+    const notifyCallId = permissionCase === "unseen-call-id" ? "policy-call-1" : callId;
+    const notifySession = permissionCase === "wrong-session-notification" ? "not-my-session" : sessionId;
+    if (permissionCase !== "no-notification" && permissionCase !== "reuse-old-seen") {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: notifySession, update: {
+        sessionUpdate: "tool_call", toolCallId: notifyCallId, name: machine, title: "Read host file", kind: "execute", status: "pending",
+      } } });
+    }
+    const requestName = permissionCase === "unknown-name" ? `mcp_${server}_write_file`
+      : permissionCase === "suffix-name" ? `${machine}_extra`
+      : permissionCase === "other-server" ? `mcp_other-server_read_file`
+      : permissionCase === "native-tool" ? "run_terminal_command"
+      : machine;
+    const toolCall = permissionCase === "title-only"
+      ? { toolCallId: callId, title: "Run call_mcp_tool?", kind: "execute", status: "pending" }
+      : { toolCallId: permissionCase === "unseen-call-id" ? "policy-other-call" : callId, name: requestName, title: "Read host file", kind: "execute", status: "pending" };
+    const options = permissionCase === "no-allow-once"
+      ? [{ optionId: "always", name: "Always", kind: "allow_always" }, { optionId: "deny", name: "Deny", kind: "reject_once" }]
+      : [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }];
+    const permission = await request("session/request_permission", {
+      sessionId: permissionCase === "wrong-session-request" ? "not-my-session" : sessionId,
+      toolCall,
+      options,
+    });
+    const selected = permission?.outcome?.outcome === "selected" ? permission.outcome.optionId : "cancelled";
+    update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `PERMISSION:${selected}` } });
+    respond(id, { stopReason: "end_turn" });
     activePrompt = undefined;
     return;
   }
@@ -230,6 +343,33 @@ async function handlePrompt(message) {
       options: [{ value: "new-server-model", name: "Server-added model" }],
     }] });
   }
+  if (text.includes("FAKE_CATALOG_CLEAR")) {
+    update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: "new-server-model", options: [] }] });
+  }
+  if (process.env.FAKE_ACP_MODEL_1_5) {
+    if (text.includes("FAKE_MODEL15_ECHO")) {
+      model15State.level = model15State.level === "low" ? "medium" : "low";
+      update({ sessionUpdate: "config_option_update", configOptions: model15Options() });
+    }
+    if (text.includes("FAKE_MODEL15_NEW_CHOICES")) {
+      update({ sessionUpdate: "config_option_update", configOptions: [{
+        id: "model", category: "model", type: "select", name: "Model", currentValue: MODEL15_FAMILY,
+        options: [{ value: MODEL15_FAMILY, name: "Gemini 3.8 Flash" }, { value: "future-family", name: "Future Family" }],
+      }] });
+    }
+    if (text.includes("FAKE_MODEL15_ADD_UNKNOWN")) {
+      update({ sessionUpdate: "config_option_update", configOptions: [{
+        id: "model", category: "model", type: "select", name: "Model", currentValue: model15State.currentModelId,
+        options: model15ModelOptions(Boolean(process.env.FAKE_ACP_MODEL_1_5_EXACT_PICKER)).concat([{ value: "new-opaque-id", name: "New Opaque" }]),
+      }] });
+    }
+    if (text.includes("FAKE_MODEL15_CLEAR")) {
+      update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: MODEL15_FAMILY, options: [] }] });
+    }
+    if (text.includes("FAKE_MODEL15_NO_SELECTOR")) {
+      update({ sessionUpdate: "config_option_update", configOptions: [] });
+    }
+  }
   const omitResultUsage = process.env.FAKE_ACP_RESULT_USAGE === "off" || text.includes("FAKE_NO_RESULT_USAGE");
   const usage = text.includes("FAKE_ZERO_RESULT_USAGE")
     ? { inputTokens: 0, outputTokens: 0, totalTokens: 0, thoughtTokens: 0 }
@@ -272,7 +412,15 @@ input.on("line", (line) => {
     // Distinct sessions must not alias one private trajectory across unrelated
     // host owners. session/load below still preserves its requested identity.
     sessionId = `fake-acp-session-${randomUUID()}`;
-    respond(message.id, {
+    if (process.env.FAKE_ACP_MODEL_1_5_EMPTY_LEGACY) {
+      respond(message.id, {
+        sessionId,
+        models: { availableModels: [], currentModelId: "removed" },
+        configOptions: [{ id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }] }],
+      });
+      return;
+    }
+    respond(message.id, process.env.FAKE_ACP_MODEL_1_5 ? { sessionId, ...model15Session() } : {
       sessionId,
       configOptions: [
         { id: "model", category: "model", name: "Model", type: "select", currentValue: "gemini-3.8-flash-high", options: [
@@ -285,17 +433,53 @@ input.on("line", (line) => {
         { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }, { value: "default", name: "Default" }] },
       ],
     });
+    if (process.env.FAKE_ACP_MODEL_1_5_START_NOTIFICATION) {
+      update({ sessionUpdate: "config_option_update", configOptions: [{
+        id: "model", category: "model", type: "select", name: "Model", currentValue: "future-family",
+        options: [{ value: "future-family", name: "Future Family" }],
+      }] });
+    }
   } else if (message?.method === "session/load") {
-    if (process.env.FAKE_ACP_LOAD_MODE === "missing") { remembered = ""; fail(message.id, -32000, "Session not found"); return; }
+    if (process.env.FAKE_ACP_LOAD_MODE === "missing") {
+      // Evidence delivered by the failing load must not survive into the
+      // replacement session; this frame exercises exactly that stale table.
+      sessionId = String(message.params?.sessionId ?? sessionId);
+      if (process.env.FAKE_ACP_LOAD_SEEN) {
+        const server = message.params?.mcpServers?.[0]?.name ?? "external_tool";
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: {
+          sessionUpdate: "tool_call", toolCallId: "load-seen-call", name: `mcp_${server}_read_file`, title: "Read host file", kind: "execute", status: "pending",
+        } } });
+      }
+      remembered = ""; fail(message.id, -32000, "Session not found"); return;
+    }
     if (process.env.FAKE_ACP_LOAD_MODE === "not-resumable") { remembered = ""; fail(message.id, -32000, "Session is not resumable"); return; }
     if (process.env.FAKE_ACP_LOAD_MODE === "method-unsupported") { fail(message.id, -32601, "Method not found"); return; }
     if (process.env.FAKE_ACP_LOAD_MODE === "auth") { fail(message.id, -32000, "Cannot load session: authentication required"); return; }
     if (process.env.FAKE_ACP_LOAD_MODE === "rejected") { fail(message.id, -32000, "Cannot load session: permission denied"); return; }
     mcpServers = message.params.mcpServers;
     sessionId = String(message.params?.sessionId ?? sessionId);
-    respond(message.id, { configOptions: [] });
+    respond(message.id, process.env.FAKE_ACP_MODEL_1_5 ? model15Session() : { configOptions: [] });
   } else if (message?.method === "session/set_config_option") {
-    respond(message.id, { configOptions: [] });
+    if (!process.env.FAKE_ACP_MODEL_1_5) { respond(message.id, { configOptions: [] }); return; }
+    if (process.env.FAKE_ACP_MODEL_1_5_EMPTY_SETTER) { respond(message.id, { configOptions: [] }); return; }
+    const { configId, value } = message.params ?? {};
+    applyModel15(configId, value);
+    let configOptions = model15Options();
+    if (configId === "model" && process.env.FAKE_ACP_MODEL_1_5_MISMATCH) {
+      configOptions = configOptions.map((option) => option.category === "model" ? { ...option, currentValue: "fake-model-low" } : option);
+    }
+    if (configId === "model" && process.env.FAKE_ACP_MODEL_1_5_LEVEL_HIGH) {
+      configOptions = configOptions.map((option) => option.category === "thought_level" ? { ...option, currentValue: "high" } : option);
+    }
+    if (configId === "thinking_level" && process.env.FAKE_ACP_MODEL_1_5_EFFORT_MISMATCH) {
+      configOptions = configOptions.map((option) => option.category === "thought_level" ? { ...option, currentValue: "medium" } : option);
+    }
+    if (configId === "model" && process.env.FAKE_ACP_MODEL_1_5_OTHER_FAMILY) {
+      configOptions = configOptions.map((option) => option.category === "model" ? { ...option, currentValue: "alt-flash" }
+        : option.category === "thought_level" ? { ...option, currentValue: "high", options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }] }
+        : option);
+    }
+    respond(message.id, { configOptions });
   } else if (message?.method === "session/prompt") {
     void handlePrompt(message);
   } else if (message?.method === "session/cancel") {

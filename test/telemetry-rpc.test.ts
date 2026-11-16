@@ -21,12 +21,11 @@ const clientPath = Bun.resolveSync("@opencode/client", dirname(fileURLToPath(imp
 const { OpenCode } = await import(clientPath);
 
 test("installed V2 client reads telemetry, consumes change events, resyncs, and enforces RPC/location/auth schemas", async () => {
-  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "OPENCODE_ANTIGRAVITY_ACP_PATH", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_NO_USAGE"];
+  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_NO_USAGE"];
   const old = keys.map(key => process.env[key]);
   const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/rpc-wire-`);
   const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
-  process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
   process.env.GEMINI_HOME = join(root, "gemini");
   process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";
   await chmod(fixture, 0o755);

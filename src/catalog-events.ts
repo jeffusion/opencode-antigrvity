@@ -1,6 +1,6 @@
 import type { AcpModelCatalog } from "./models.js";
 
-type Listener = (scope: string, catalog: AcpModelCatalog) => void;
+type Listener = (scope: string, catalog?: AcpModelCatalog) => void;
 const listeners = new Set<Listener>();
 
 export function onAcpCatalog(listener: Listener): () => void {
@@ -8,6 +8,7 @@ export function onAcpCatalog(listener: Listener): () => void {
   return () => { listeners.delete(listener); };
 }
 
-export function emitAcpCatalog(scope: string | undefined, catalog: AcpModelCatalog): void {
+/** A missing catalog invalidates the scope's last complete discovery. */
+export function emitAcpCatalog(scope: string | undefined, catalog?: AcpModelCatalog): void {
   if (scope) for (const listener of listeners) listener(scope, catalog);
 }

@@ -245,7 +245,7 @@ export type Turn = {
   selected: AcpModelSelection;
   request: ReturnType<typeof parseMessage>;
   signal: AbortSignal;
-  mcp?: Pick<AcpWorkerOptions, "mcpServers" | "waitingForTools">;
+  mcp?: Pick<AcpWorkerOptions, "mcpServers" | "mcpToolNames" | "waitingForTools">;
 };
 
 export async function* textTurn({ directory, detection, selected, request, signal, mcp }: Turn): AsyncGenerator<AcpEvent> {
@@ -266,7 +266,6 @@ export async function* textTurn({ directory, detection, selected, request, signa
     worker = await createAcpWorker({
       cwd: workspace,
       executable: detection.executable,
-      executableArgs: detection.args,
       model: selected.acpModel,
       effort: selected.effort,
       hostTools: true,

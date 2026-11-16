@@ -37,7 +37,7 @@ jobs:
               shift
               timeout 15s env -i PATH=/nonexistent HOME="$smoke_dir" AGY_PORT=0 \
                 AGY_API_KEY=smoke-test-key-at-least-32-characters \
-                OPENCODE_ANTIGRAVITY_ACP_PATH="$smoke_dir/missing-acp" "$@" \
+                OPENCODE_ANTIGRAVITY_CLI_PATH="$smoke_dir/missing-cli" "$@" \
                 "$release_dir/agy-api-linux-x86_64" > startup.log 2>&1 || status=$?
               cat startup.log
               test "$status" -eq 1
@@ -102,22 +102,39 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
       - run: mkdir -p /tmp/opencode
       - run: bun ci
       - run: bun run compile
-      - name: Download the reviewed official macOS ARM64 pair
+      # Frozen pin migration-assets-xAMwaBG2/frozen-platforms.json (1.5.9-4515810895593472).
+      # The official payload SHA512 is verified before the product installer
+      # (Bun.Archive in memory, single named member, exe SHA256+size pin)
+      # publishes the executable; nothing is executed here.
+      - name: Download the pinned official macOS ARM64 CLI
         run: |
-          directory="$RUNNER_TEMP/agy-acp-1.3.0"
-          curl --fail --location 'https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.3.0-darwin-arm64.zip' -o "$RUNNER_TEMP/agy-acp.zip"
-          unzip "$RUNNER_TEMP/agy-acp.zip" -d "$directory"
-          chmod +x "$directory/agy_acp_server.par" "$directory/localharness_external"
+          set -euo pipefail
+          directory="$RUNNER_TEMP/antigravity-cli-1.5.9"
+          payload="$RUNNER_TEMP/cli_mac_arm64.tar.gz"
+          curl --fail --location --retry 0 --proto '=https' --tlsv1.2 \
+            'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.9-4515810895593472/darwin-arm/cli_mac_arm64.tar.gz' \
+            -o "$payload"
+          printf '%s  %s\n' '690cd6a5a5fdb23564fb1b14f7f6ae368fa3636b7630f56c574a6dfc0e2791a0e5b93d6515be1650c8a268cfb28440e1b9cbaa1c5b85aa762ab25b51c1fccda5' "$payload" | shasum -a 512 -c -
+          cli_payload="$payload" cli_directory="$directory" bun --eval '
+            const payload = process.env.cli_payload;
+            const directory = process.env.cli_directory;
+            const { installAcpServer, cliDistribution } = await import(process.cwd() + "/src/acp-install.ts");
+            const bytes = new Uint8Array(await Bun.file(payload).arrayBuffer());
+            const installed = await installAcpServer(directory, async () => new Response(bytes), undefined, cliDistribution("darwin", "arm64"));
+            console.log(installed);
+          '
+          test "$(stat -f %z "$directory/antigravity")" -eq 223424816
+          printf '%s  %s\n' 'fad3628ad91fe8613a72f074a1c5fde7cd816517788a5b9be96703f7d256741a' "$directory/antigravity" | shasum -a 256 -c -
           echo "AGY_TEST_MACOS_ACP_DIR=$directory" >> "$GITHUB_ENV"
       # Linux runs the complete suite; these platform jobs also exercise the
       # portable native-lock, tombstone, atomic-write and deletion-queue cases.
-      - run: bun test test/macos-support.test.ts test/windows-support.test.ts test/file-lock.test.ts test/acp-install.test.ts test/atomic-write.test.ts test/deletion-recovery.test.ts test/bounded-retry-queue.test.ts test/cli-credentials.test.ts test/auth-bridge.test.ts test/host-environment.test.ts test/acp-process.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts test/usage-fallback.test.ts --timeout 30000
+      # Factory suites (acp-process, usage-fallback via SessionPool ->
+      # createAcpWorker) stay Linux-only: darwin/windows fail closed at the
+      # unverified-platform gate until real hardware/account validation lands.
+      - run: bun test test/macos-support.test.ts test/windows-support.test.ts test/file-lock.test.ts test/acp-install.test.ts test/atomic-write.test.ts test/deletion-recovery.test.ts test/bounded-retry-queue.test.ts test/cli-credentials.test.ts test/auth-bridge.test.ts test/host-environment.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts --timeout 30000
   windows:
     if: github.event_name != 'push' || github.ref_type != 'tag'
     runs-on: windows-latest
@@ -127,19 +144,21 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
       - run: bun ci
       - run: bun run compile
-      # Review/profile checks need no Google account and never run inference.
-      - name: Download the reviewed official Windows pair
+      # Frozen pin migration-assets-xAMwaBG2/frozen-platforms.json (1.5.9-4515810895593472).
+      # Bare .exe payload: official SHA512 first, then actual exe SHA256 and
+      # size. Nothing is executed here.
+      - name: Download the pinned official Windows x64 CLI
         shell: pwsh
         run: |
-          $directory = Join-Path $env:RUNNER_TEMP 'agy-acp-1.3.0'
-          $archive = Join-Path $env:RUNNER_TEMP 'agy-acp-1.3.0.zip'
-          Invoke-WebRequest 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.3.0-windows-x86_64.zip' -OutFile $archive
-          Expand-Archive $archive -DestinationPath $directory
+          $directory = Join-Path $env:RUNNER_TEMP 'antigravity-cli-1.5.9'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          $exe = Join-Path $directory 'antigravity.exe'
+          Invoke-WebRequest 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.9-4515810895593472/windows-x64/cli_windows_x64.exe' -OutFile $exe
+          if ((Get-FileHash $exe -Algorithm SHA512).Hash.ToLowerInvariant() -ne '539a9415a686d9ec45f5c59fe7d32c485c6fa9abaea50208ae8ede4ed3622b9fb2bfd6680c87dc52344981172a96ddacb261ff4231276b5572fb5b62a9b0221e') { throw 'Official CLI payload SHA512 mismatch' }
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne '8803c289cac04d6e53f2211592d9981c2d5760bc0d9b4a7f222ef6ecc7abb38a') { throw 'Official CLI executable SHA256 mismatch' }
+          if ((Get-Item $exe).Length -ne 231726744) { throw 'Official CLI executable size mismatch' }
           "AGY_TEST_WINDOWS_ACP_DIR=$directory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       # Process fixtures elsewhere use POSIX shebangs; native tests below
       # exercise Windows executables, filesystem, authentication and budgets.

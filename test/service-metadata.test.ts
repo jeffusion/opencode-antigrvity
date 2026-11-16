@@ -37,7 +37,6 @@ async function startService(directory: string, promptLog: string, environment: R
       PATH: [dirname(process.execPath), process.env.PATH].join(delimiter),
       AGY_TEST_SERVICE_METADATA_CHILD: "1", AGY_API_KEY: testKey, AGY_PORT: "0",
       AGY_DATA_DIR: directory, AGY_CREDENTIALS_DIR: join(directory, "credentials"),
-      OPENCODE_ANTIGRAVITY_ACP_PATH: join(import.meta.dir, "fixtures", "fake-acp.mjs"),
       FAKE_ACP_EXTRA_MODEL: model, FAKE_ACP_PROMPT_LOG: promptLog,
       ...environment,
     },

@@ -7,7 +7,7 @@ import { LOCAL_API_KEY, SESSION_HEADER } from "../src/constants.js";
 
 test("proxy replacement waits for old cleanup and keeps the reopened pool usable", async () => {
   const root = await mkdtemp(join(process.env.TMPDIR || "/tmp/opencode", "agy-proxy-lifecycle-"));
-  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "OPENCODE_ANTIGRAVITY_ACP_PATH", "GEMINI_HOME", "FAKE_ACP_PROMPT_LOG", "FAKE_ACP_STATE_FILE"];
+  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "FAKE_ACP_PROMPT_LOG", "FAKE_ACP_STATE_FILE"];
   const saved = keys.map(key => process.env[key]);
   const fixture = join(import.meta.dir, "fixtures/fake-acp.mjs");
   const compatibility = fixtureCompatibility();
@@ -20,7 +20,6 @@ test("proxy replacement waits for old cleanup and keeps the reopened pool usable
   let restarting: Promise<number> | undefined;
   try {
     process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
-    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
     process.env.GEMINI_HOME = join(root, "gemini");
     delete process.env.FAKE_ACP_PROMPT_LOG;
     delete process.env.FAKE_ACP_STATE_FILE;

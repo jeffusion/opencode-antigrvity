@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { AcpWorker, createAcpWorker, type AcpWorkerOptions } from "./acp-process.js";
+import { CLI_AGENT_SHA256 } from "./cli-agent.js";
 import {
   AgyAbortError,
   AgyBusyError,
@@ -15,10 +16,10 @@ import {
 } from "./constants.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AcpEvent } from "./acp-process.js";
-import { HarnessFailureGuard } from "./protocol.js";
+import { HarnessFailureGuard, isSuccessfulResult } from "./protocol.js";
 import { extractTextContent, historyReferenceBlocks, messageContentToAcp, hostResultMessageToAcp, quotedBlocks, type HostMessage } from "./prompt.js";
 import { canonical, extendsBoundary, fingerprints, type ConversationState } from "./coordinator.js";
-import { ownershipKey, sessionStore, type SessionRecord } from "./session-store.js";
+import { ownershipKey, sessionStore, validResponse, type RequestReceipt, type SessionRecord } from "./session-store.js";
 import { debug, info, warn } from "./log.js";
 import { collectTurn, hostVisibleContent } from "./translate.js";
 import { blockBudget, historyCharacterLimit } from "./budget.js";
@@ -37,6 +38,10 @@ export type SessionSettings = {
   catalogScope?: string;
   hostTools?: boolean;
   mcpServers?: AcpWorkerOptions["mcpServers"];
+  /** Exact host tool names behind HOST_MCP_SERVER_NAME, taken from the MCP
+   * endpoint's own tools/list; the worker's permission gate is deny-by-default
+   * without it. Never derived from titles or environment. */
+  mcpToolNames?: AcpWorkerOptions["mcpToolNames"];
   waitingForTools?: () => boolean;
   hasToolActivity?: () => boolean;
 };
@@ -52,7 +57,9 @@ export type SessionTurnRequest = {
   messages?: HostMessage[];
   hostSessionID?: string;
   responseCursor?: { start: number; events: number; contextOccupancy?: ContextOccupancyCandidate };
-  identity?: { value?: string };
+  identity?: { value?: string; owned?: boolean };
+  /** Frozen continuation identity; the pool executes and replays under this id. */
+  receipt?: { id: string; digest: string };
   suppressToolTelemetry?: boolean;
 };
 
@@ -69,14 +76,62 @@ type SessionEntry = {
   executionGeneration?: string;
 };
 
+/** Content identity of a turn: the canonical request fields without any
+ * client-supplied request id, so continuations stay stable across headers. */
+export function contentIdentity(input: { priorMessages?: SessionTurnRequest["priorMessages"]; prompt?: ContentBlock[]; messages?: HostMessage[]; instructions?: string; model: string }): string {
+  return createHash("sha256").update(canonical({
+    prior: input.priorMessages, prompt: input.prompt,
+    messages: input.messages ? fingerprints(input.messages) : undefined,
+    instructions: input.instructions, model: input.model,
+  })).digest("hex");
+}
+
+export function turnIdentity(request: SessionTurnRequest): string {
+  return request.requestId || contentIdentity({
+    priorMessages: request.priorMessages, prompt: request.prompt, messages: request.messages,
+    instructions: request.instructions, model: request.settings.model,
+  });
+}
+
+/** Basic shape of a cached event; every event in a slice must be sound, not
+ * just its terminal, before the payload can be replayed. */
+function wellFormedEvent(event: AcpEvent): boolean {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  if (typeof event.sessionId !== "string") return false;
+  if (event.event === "update") return Boolean(event.update) && typeof event.update === "object" && !Array.isArray(event.update) && typeof (event.update as { sessionUpdate?: unknown }).sessionUpdate === "string";
+  if (event.event === "result") return Boolean(event.result) && typeof event.result === "object" && !Array.isArray(event.result) && typeof (event.result as { stopReason?: unknown }).stopReason === "string";
+  return false;
+}
+
+/** A HostBridge response slice replays only when it is recorded for this exact
+ * digest, every cached event is well formed, and it ends in a successful
+ * result. Stale, running, parked, expired, legacy or corrupt slices are
+ * fail-closed: native turn events are not a substitute for a lost response,
+ * and the request must not run again. */
+export function responseSliceEvents(receipt: RequestReceipt, expectedDigest: string): AcpEvent[] {
+  const response = validResponse(receipt.response) ? receipt.response : undefined;
+  const events = response?.digest === expectedDigest && response.state === "completed" ? response.events : undefined;
+  if (events?.length && events.every(wellFormedEvent) && isSuccessfulResult(events[events.length - 1])) return events;
+  if (response?.state === "parked") throw new AgyError("invalid_request", "This request already started and returned its tool pause. Retrying could repeat workspace changes; deliver the tool results to continue.", { code: "agy_request_already_started" });
+  const completed = response?.state === "completed" || receipt.state === "completed";
+  throw new AgyError("invalid_request", completed
+    ? "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again."
+    : "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.",
+    { code: completed ? "agy_completed_response_unavailable" : "agy_request_already_started" });
+}
+
 function settingsSignature(settings: SessionSettings): string {
   return JSON.stringify({
+    // The fixed host agent is part of the execution profile: a different
+    // agent build cannot resume a native/PAR ACP session created by another.
+    agent: CLI_AGENT_SHA256,
     cwd: settings.cwd,
     model: settings.model,
     effort: settings.effort ?? null,
     mode: settings.mode ?? null,
     catalogScope: settings.catalogScope,
     mcpServers: settings.mcpServers,
+    mcpToolNames: settings.mcpToolNames,
     hostTools: settings.hostTools,
   });
 }
@@ -121,6 +176,7 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
     mode: settings.mode,
     hostTools: settings.hostTools,
     mcpServers: settings.mcpServers,
+    mcpToolNames: settings.mcpToolNames,
     waitingForTools: settings.waitingForTools,
   };
 }
@@ -193,19 +249,23 @@ export class SessionPool {
       if (this.disposed) throw new AgyError("invalid_request", "The Antigravity session pool has been shut down", { code: "agy_pool_closed", retryable: false });
       if (signal.aborted) throw new AgyAbortError();
       const unlock = await sessionStore.lockTurn(ownershipKey(request.key, request.hostSessionID));
+      if (request.identity) request.identity.owned = true;
       try {
         if (signal.aborted) throw new AgyAbortError();
-        const identity = request.requestId || createHash("sha256").update(canonical({
-          prior: request.priorMessages, prompt: request.prompt,
-          messages: request.messages ? fingerprints(request.messages) : undefined,
-          instructions: request.instructions, model: request.settings.model,
-        })).digest("hex");
+        // A frozen continuation id wins over any request-shape change (header).
+        const identity = request.receipt?.id ?? turnIdentity(request);
         const receipt = await sessionStore.receipt(request.key, identity);
         if (receipt && receipt.state !== "rejected-before-execution" && receipt.state !== "prepared") {
-          if (receipt.state === "completed" && receipt.events) {
+          // The HostBridge slice contract applies only to a frozen receipt: the
+          // recorded slice must match this digest or the turn fails closed. A
+          // plain turn replays its own completed native events.
+          const replay = request.receipt
+            ? responseSliceEvents(receipt, request.receipt.digest)
+            : receipt.state === "completed" && receipt.events?.length ? receipt.events : undefined;
+          if (replay) {
             try {
               const guard = new HarnessFailureGuard();
-              for (const event of receipt.events) guard.push(event);
+              for (const event of replay) guard.push(event);
             } catch (error) {
               await entry.worker?.stop(true);
               entry.worker = undefined;
@@ -220,15 +280,20 @@ export class SessionPool {
               }
               throw error;
             }
-            yield* receipt.events;
+            yield* replay;
             return;
           }
-          if (receipt.state === "completed") throw new AgyError("invalid_request", "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again.", { code: "agy_completed_response_unavailable" });
-          throw new AgyError("invalid_request", "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
+          throw new AgyError("invalid_request", receipt.state === "completed"
+            ? "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again."
+            : "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.",
+            { code: receipt.state === "completed" ? "agy_completed_response_unavailable" : "agy_request_already_started" });
         }
         if (request.identity) request.identity.value = identity;
         yield* this.runTurn(entry, { ...request, signal }, identity);
-      } finally { await unlock(); }
+      } finally {
+        if (request.identity) request.identity.owned = false;
+        await unlock();
+      }
     } finally {
       void previous.then(release);
       entry.pending = Math.max(0, entry.pending - 1);
@@ -339,7 +404,7 @@ export class SessionPool {
     validateMediaBlocks(prompt);
     blockBudget(request.settings.model, prompt, request.settings.outputBudget);
     // This write must succeed before sending a prompt that can change files.
-    await sessionStore.saveReceipt(request.key, identity, { state: "prepared" });
+    await sessionStore.saveReceipt(request.key, identity, { state: "prepared", ...(request.receipt ? { response: { digest: request.receipt.digest, state: "running" as const } } : {}) });
     if (entry.conversation) entry.conversation.resumable = false;
     await this.persistWorker(entry, request.key, request.settings);
     entry.historyTransferred = true;

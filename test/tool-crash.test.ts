@@ -11,7 +11,7 @@ test("SIGKILL matrix exercises integrated tool persistence, exposure and deliver
     await mkdir(join(root, "home"), { mode: 0o700 });
     const launch = (recovery: boolean) => {
       const child = spawn(process.execPath, ["test", join(import.meta.dir, "fixtures/crash-runtime.ts")], {
-        env: { ...process.env, AGY_CRASH_CHILD: "1", AGY_CRASH_POINT: point, AGY_CRASH_RECOVERY: recovery ? "1" : "0", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"), XDG_STATE_HOME: join(root, "state"), GEMINI_HOME: join(root, "gemini"), OPENCODE_ANTIGRAVITY_DATA_DIR: root, OPENCODE_ANTIGRAVITY_ACP_PATH: join(import.meta.dir, "fixtures/fake-acp.mjs"), FAKE_ACP_PID_LOG: join(root, "acp-pids"), FAKE_ACP_PROMPT_LOG: join(root, "prompts.jsonl") },
+        env: { ...process.env, AGY_CRASH_CHILD: "1", AGY_CRASH_POINT: point, AGY_CRASH_RECOVERY: recovery ? "1" : "0", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"), XDG_STATE_HOME: join(root, "state"), GEMINI_HOME: join(root, "gemini"), OPENCODE_ANTIGRAVITY_DATA_DIR: root, FAKE_ACP_PID_LOG: join(root, "acp-pids"), FAKE_ACP_PROMPT_LOG: join(root, "prompts.jsonl") },
         stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
       let output = "";

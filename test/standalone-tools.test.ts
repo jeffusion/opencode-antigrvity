@@ -130,7 +130,6 @@ if (process.env.AGY_TEST_STANDALONE_CHILD === "1") {
     env: {
       PATH: [dirname(process.execPath), process.env.PATH].join(delimiter),
       AGY_TEST_STANDALONE_CHILD: "1", AGY_API_KEY: testKey, AGY_PORT: "0", AGY_DATA_DIR: directory,
-      OPENCODE_ANTIGRAVITY_ACP_PATH: join(import.meta.dir, "fixtures", "fake-acp.mjs"),
       FAKE_ACP_PROMPT_LOG: promptLog, FAKE_ACP_MCP_LIST_LOG: toolLog,
       OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS: "512",
       OPENCODE_ANTIGRAVITY_MODELS_DEV: "0",

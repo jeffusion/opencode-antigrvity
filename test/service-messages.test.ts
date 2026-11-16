@@ -2,7 +2,9 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createAcpWorker } from "../src/acp-process.js";
 import { errorResponse } from "../src/anthropic-http.js";
+import { CLI_AGENT_MARKDOWN, cliAgentPath, cliSessionArgs } from "../src/cli-agent.js";
 import { geminiJson, geminiStream, parseGeminiContent } from "../src/gemini-content.js";
 import { ClientToolTurn } from "../src/tool-turn.js";
 import { openAIErrorResponse, openAIJson, openAIStream } from "../src/openai-chat.js";
@@ -17,6 +19,35 @@ const image = (data: string, media_type = mimeType) => ({ type: "image", source:
 const text: AcpEvent = { event: "update", sessionId: "test", update: {
   sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" },
 } };
+
+test("the worker factory uses its private CLI home, cwd and fixed argv", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agy-cli-factory-"));
+  const compatibility = fixtureCompatibility();
+  let worker: Awaited<ReturnType<typeof createAcpWorker>> | undefined;
+  try {
+    worker = await createAcpWorker({
+      cwd: directory,
+      executable: join(import.meta.dir, "fixtures/fake-acp.mjs"),
+      model: "fake-model-low",
+      environment: {
+        GEMINI_HOME: join(directory, "source"),
+        OPENCODE_ANTIGRAVITY_DATA_DIR: join(directory, "data"),
+        GEMINI_API_KEY: "must-not-reach-native",
+      },
+    });
+    const home = worker.options.environment!.GEMINI_HOME!;
+    expect(home).not.toBe(join(directory, "source"));
+    expect(worker.options.cwd).toBe(join(home, "workspace"));
+    expect(worker.options.executableArgs).toEqual(cliSessionArgs(home));
+    expect(await readFile(cliAgentPath(home), "utf8")).toBe(CLI_AGENT_MARKDOWN);
+    expect(worker.options.environment!.GEMINI_API_KEY).toBeUndefined();
+    expect(worker.options.environment!.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+  } finally {
+    await worker?.stop(true);
+    compatibility.mockRestore();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("Anthropic accepts text history and rejects server tools and unsupported media", () => {
   expect(parseMessage({

@@ -31,6 +31,25 @@ export type SessionRecord = {
 
 type DiskStore = Record<string, SessionRecord>;
 
+export type ToolResultStage = "direct" | "profile-change" | "active-results" | "inactive-trailing" | "history-reconciliation";
+
+/** Validate a host result against its durable call and return its digest.
+ * Conflicts throw the same privacy-preserving diagnostic as saveToolResult. */
+export function toolResultDigest(call: ToolRecord, id: string, result: unknown, stage: ToolResultStage = "direct"): string {
+  const resultCanonical = canonical(result);
+  const resultDigest = digest(resultCanonical);
+  if (call.resultDigest && call.resultDigest !== resultDigest) {
+    const diagnostic = {
+      callID: id, stage, delivery: call.delivery ?? null, payloadExpired: call.payloadExpired ?? false,
+      previousDigest: call.resultDigest, incomingDigest: resultDigest,
+      previousBytes: call.payloadExpired || call.result === undefined ? null : Buffer.byteLength(canonical(call.result), "utf8"),
+      incomingBytes: Buffer.byteLength(resultCanonical, "utf8"),
+    };
+    throw new AgyError("invalid_request", `Conflicting result for completed tool call ${JSON.stringify(diagnostic)}`);
+  }
+  return resultDigest;
+}
+
 export type ToolRecord = Record<string, unknown> & {
   version: 2; conversationKey: string;
   call: { id: string; name: string; input: Record<string, unknown>; type?: string };
@@ -349,22 +368,12 @@ export class SessionStore {
     } finally { await releaseLocks(unlock, release); }
   }
 
-  async saveToolResult(key: string, id: string, result: unknown, stage: "direct" | "profile-change" | "active-results" | "inactive-trailing" | "history-reconciliation" = "direct"): Promise<void> {
+  async saveToolResult(key: string, id: string, result: unknown, stage: ToolResultStage = "direct"): Promise<void> {
     const unlock = await this.lockTurn(`tool-result:${key}:${id}`, 5000);
     try {
     const call = await this.toolCall(key, id);
     if (!call) throw new AgyError("invalid_request", "Tool result has no durable originating call");
-    const resultCanonical = canonical(result);
-    const resultDigest = digest(resultCanonical);
-    if (call.resultDigest && call.resultDigest !== resultDigest) {
-      const diagnostic = {
-        callID: id, stage, delivery: call.delivery ?? null, payloadExpired: call.payloadExpired ?? false,
-        previousDigest: call.resultDigest, incomingDigest: resultDigest,
-        previousBytes: call.payloadExpired || call.result === undefined ? null : Buffer.byteLength(canonical(call.result), "utf8"),
-        incomingBytes: Buffer.byteLength(resultCanonical, "utf8"),
-      };
-      throw new AgyError("invalid_request", `Conflicting result for completed tool call ${JSON.stringify(diagnostic)}`);
-    }
+    const resultDigest = toolResultDigest(call, id, result, stage);
     await this.saveToolCall(key, id, { ...call, result, resultDigest, delivery: call.delivery ?? "result-persisted", payloadExpired: false });
     } finally { await unlock(); }
   }
@@ -451,16 +460,29 @@ export class SessionStore {
         // Only terminal response payloads expire; calls/results and uncertain
         // work remain recovery evidence. Legacy records migrate conservatively.
         if (value.state !== "completed") continue;
-        if (!Number.isFinite(value.updatedAt)) { value.updatedAt = now; await atomicWrite(path, value); }
-        else if (value.events && value.updatedAt < now - PAYLOAD_RETENTION_MS && typeof value.conversationKey === "string" && digest(value.conversationKey) === directory) {
-          let unlock: (() => Promise<void>) | undefined;
-          try {
-            unlock = await this.lockTurn(ownershipKey(value.conversationKey, typeof value.hostSessionID === "string" ? value.hostSessionID : undefined));
-            const current = JSON.parse(await readFile(path, "utf8"));
-            if (current.state === "completed" && current.updatedAt < now - PAYLOAD_RETENTION_MS) { delete current.events; await atomicWrite(path, current); }
-          } catch (error) { if (!(error instanceof AgyBusyError)) throw error; }
-          finally { await unlock?.(); }
-        }
+        const legacy = !Number.isFinite(value.updatedAt);
+        const expired = !legacy && value.updatedAt < now - PAYLOAD_RETENTION_MS && typeof value.conversationKey === "string" && digest(value.conversationKey) === directory;
+        if (!legacy && !expired) continue;
+        let unlockOwner: (() => Promise<void>) | undefined;
+        let unlock: (() => Promise<void>) | undefined;
+        try {
+          // Lock order owner -> receipt, the same as every receipt writer; a
+          // save never waits on these in the reverse direction.
+          if (typeof value.conversationKey === "string") unlockOwner = await this.lockTurn(ownershipKey(value.conversationKey, typeof value.hostSessionID === "string" ? value.hostSessionID : undefined));
+          unlock = await this.lockTurn(`receipt:${path}`, 5000);
+          let current;
+          try { current = JSON.parse(await readFile(path, "utf8")); } catch (error: any) { if (error.code === "ENOENT") continue; throw error; }
+          if (!current || typeof current !== "object" || Array.isArray(current)) continue;
+          // Re-decide on the copy under the lock: a save may have replaced
+          // this record after the unlocked probe read above.
+          if (!Number.isFinite(current.updatedAt)) { current.updatedAt = now; await atomicWrite(path, current); continue; }
+          if (current.state !== "completed" || current.updatedAt >= now - PAYLOAD_RETENTION_MS) continue;
+          let changed = false;
+          if (current.events) { delete current.events; changed = true; }
+          if (current.response?.state === "completed" && current.response.events) { delete current.response.events; changed = true; }
+          if (changed) await atomicWrite(path, current);
+        } catch (error) { if (!(error instanceof AgyBusyError)) throw error; }
+        finally { await unlock?.(); await unlockOwner?.(); }
       }
     }
   }
@@ -474,29 +496,59 @@ export class SessionStore {
   }
 
   async receipt(key: string, request: string): Promise<RequestReceipt | undefined> {
+    const path = receiptPath(key, request);
+    // Same short lock as saveReceipt and pruning: the TTL trim below is a
+    // read-modify-write and must not write back a copy that predates a save.
+    const unlock = await this.lockTurn(`receipt:${path}`, 5000);
     try {
-      const value = JSON.parse(await readFile(receiptPath(key, request), "utf8"));
-      if (!["started", "prepared", "submitted", "running", "parked", "completed", "rejected-before-execution", "interrupted", "uncertain"].includes(value?.state)) throw new Error("Invalid request receipt");
-      if (value.state === "completed" && value.events && Number.isFinite(value.updatedAt) && value.updatedAt < Date.now() - PAYLOAD_RETENTION_MS) {
-        delete value.events;
-        await atomicWrite(receiptPath(key, request), value);
+      // The stored record carries updatedAt alongside the RequestReceipt shape.
+      let value;
+      try {
+        value = JSON.parse(await readFile(path, "utf8"));
+        if (!["started", "prepared", "submitted", "running", "parked", "completed", "rejected-before-execution", "interrupted", "uncertain"].includes(value?.state)) throw new Error("Invalid request receipt");
+        // An unverified slice is corruption, not data: never hand it out.
+        if (value.response !== undefined && !validResponse(value.response)) throw new Error("Invalid request receipt");
+      } catch (error: any) {
+        if (error.code === "ENOENT") return undefined;
+        if (error instanceof SyntaxError || error.message === "Invalid request receipt") {
+          await quarantineJson(path, "invalid_receipt");
+          // Keep a durable fail-closed tombstone at the original identity. Moving
+          // corruption away alone would wrongly authorize another execution.
+          await atomicWrite(path, { version: 1, state: "uncertain", updatedAt: Date.now() });
+        }
+        throw error;
+      }
+      if (value.state === "completed" && Number.isFinite(value.updatedAt) && value.updatedAt < Date.now() - PAYLOAD_RETENTION_MS) {
+        let changed = false;
+        if (value.events) { delete value.events; changed = true; }
+        if (value.response?.state === "completed" && value.response.events) { delete value.response.events; changed = true; }
+        if (changed) await atomicWrite(path, value);
       }
       return value;
-    } catch (error: any) {
-      if (error.code === "ENOENT") return undefined;
-      if (error instanceof SyntaxError || error.message === "Invalid request receipt") {
-        await quarantineJson(receiptPath(key, request), "invalid_receipt");
-        // Keep a durable fail-closed tombstone at the original identity. Moving
-        // corruption away alone would wrongly authorize another execution.
-        await atomicWrite(receiptPath(key, request), { version: 1, state: "uncertain", updatedAt: Date.now() });
-      }
-      throw error;
-    }
+    } finally { await unlock(); }
   }
 
   async saveReceipt(key: string, request: string, receipt: RequestReceipt): Promise<void> {
     const hostSessionID = (await this.get(key))?.conversation?.hostSessionID;
-    await atomicWrite(receiptPath(key, request), { version: 1, ...receipt, conversationKey: key, ...(hostSessionID ? { hostSessionID } : {}), updatedAt: Date.now() });
+    const path = receiptPath(key, request);
+    // Short receipt-file lock so the running turn's progress writes cannot
+    // erase a newer per-response slice recorded on the same identity. Lock
+    // order is always owner-lock (caller) -> receipt lock, never reversed.
+    const unlock = await this.lockTurn(`receipt:${path}`, 5000);
+    try {
+      let stored: RequestReceipt | undefined;
+      try { stored = JSON.parse(await readFile(path, "utf8")); }
+      catch (error: any) { if (error.code !== "ENOENT") throw error; }
+      const previous = validResponse(stored?.response) ? stored!.response : undefined;
+      const { response: requested, ...rest } = receipt;
+      let response = validResponse(requested) ? requested : undefined;
+      if (!response && previous) {
+        // Progress writes keep the slice metadata; parking the turn also parks
+        // the running HTTP slice that exposed the tool calls.
+        response = receipt.state === "parked" && previous.state === "running" ? { ...previous, state: "parked" } : previous;
+      }
+      await atomicWrite(path, { version: 1, ...rest, ...(response ? { response } : {}), conversationKey: key, ...(hostSessionID ? { hostSessionID } : {}), updatedAt: Date.now() });
+    } finally { await unlock(); }
   }
 
 }
@@ -507,7 +559,20 @@ export function sessionStoreDirectory(): string {
   return dataDirectory();
 }
 
-export type RequestReceipt = { state: "started" | "prepared" | "submitted" | "running" | "parked" | "completed" | "rejected-before-execution" | "interrupted" | "uncertain"; events?: AcpEvent[] };
+export type RequestReceipt = {
+  state: "started" | "prepared" | "submitted" | "running" | "parked" | "completed" | "rejected-before-execution" | "interrupted" | "uncertain";
+  events?: AcpEvent[];
+  /** Per-HTTP-response slice under this identity; a parked slice is a tombstone. */
+  response?: { digest: string; state: "running" | "parked" | "completed"; events?: AcpEvent[] };
+};
+
+export function validResponse(value: unknown): value is NonNullable<RequestReceipt['response']> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const response = value as NonNullable<RequestReceipt["response"]>;
+  return typeof response.digest === "string" && response.digest.length > 0 &&
+    (response.state === "running" || response.state === "parked" || response.state === "completed") &&
+    (response.events === undefined || Array.isArray(response.events));
+}
 
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 async function quarantineJson(path: string, reason: string): Promise<void> {

@@ -31,8 +31,8 @@ async function prepareCredentials(directory: string): Promise<void> {
   if (!fromPlugin || (fromPlugin !== ".." && !fromPlugin.startsWith(`..${sep}`) && !isAbsolute(fromPlugin))) {
     throw new Error("Use a dedicated AGY_CREDENTIALS_DIR for the service");
   }
-  for (const entry of ["antigravity-cli", "antigravity-acp", "antigravity-cli/antigravity-oauth-token",
-    "antigravity-acp/acp_token.json", "antigravity-acp/acp_business_token.json", "antigravity-acp/settings.json"]) {
+  for (const entry of ["antigravity-cli", "antigravity-cli/antigravity-oauth-token",
+    "antigravity-acp", "antigravity-acp/settings.json"]) {
     const stat = await lstat(join(directory, entry)).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
     });
@@ -212,7 +212,6 @@ async function serve(directory: string, hostname: string, port: number, keyHash:
     try {
       detection = await ensureAcpServer(undefined, stop.signal);
       if (draining) return;
-      process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = detection.executable;
       await refreshModelMetadata();
       if (draining) return;
       metadataTimer = setInterval(() => { void refreshModelMetadata(); }, 24 * 60 * 60_000);

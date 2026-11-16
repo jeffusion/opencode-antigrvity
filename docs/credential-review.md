@@ -1,5 +1,10 @@
 # Windows CLI credential review
 
+This is historical evidence for the existing credential reader, not proof
+of CLI 1.5.9's selected account, refresh destination or private-store isolation.
+The unreleased CLI migration temporarily gates runtime execution to Linux x64;
+Windows/macOS asset verification does not lift that gate.
+
 Reviewed the official CLI 1.3.5 Windows x64 artifact linked by the install
 service's `manifests/windows_amd64.json` on 2026-10-14:
 `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.3.5-6164039479459840/windows-x64/cli_windows_x64.exe`.
@@ -25,7 +30,11 @@ details. A custom HOME or GEMINI_HOME remains file-only. It never creates a
 CLI token file, starts login, enumerates credentials, or writes the keyring.
 Native CI uses synthetic credentials on a disposable GitHub runner only.
 
-# macOS ARM64 isolation review
+# macOS ARM64 isolation review (ACP 1.3.0)
+
+This historical review covers 1.3.0. See the current
+[ACP release pin and isolation review](development.md#acp-release-pin-and-isolation)
+for the CLI migration boundary; it does not extend these PAR findings to CLI 1.5.9.
 
 Downloaded the official ACP 1.3.0 Darwin ARM64 archive and independently
 verified both profile SHA-256 values. Extracted ZIP local entries from the

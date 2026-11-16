@@ -64,17 +64,16 @@ export function acpModelCatalog(
 }
 
 /** No invented availability when discovery has never succeeded. */
-export function fallbackAcpModelCatalog(executable = "agy_acp_server.par", version: string | null = null): AcpModelCatalog {
+export function fallbackAcpModelCatalog(executable = "agy", version: string | null = null): AcpModelCatalog {
   return { ...acpModelCatalog(executable, version), source: "empty", discoveredAt: 0 };
 }
 
-/** Missing model state means "no update"; an advertised empty list is authoritative. */
+/** Missing model state means "no update"; an advertised empty list is authoritative.
+ * The legacy `models.availableModels` list carries the complete set of exact
+ * wire IDs, so when present it wins over the grouped UI pickers. */
 export function catalogFromSession(response: unknown, executable: string, version: string | null = null): AcpModelCatalog | undefined {
   if (!response || typeof response !== "object") return;
   const data = response as Record<string, any>;
-  const model = Array.isArray(data.configOptions)
-    ? data.configOptions.find((option: any) => option?.category === "model") ?? data.configOptions.find((option: any) => option?.id === "model")
-    : undefined;
   const entries: Array<[string, string]> = [];
   const flatten = (options: unknown[]) => {
     for (const option of options) {
@@ -84,15 +83,18 @@ export function catalogFromSession(response: unknown, executable: string, versio
       else if (typeof entry.value === "string" && entry.value) entries.push([entry.value, typeof entry.name === "string" ? entry.name : entry.value]);
     }
   };
-  if (model && Array.isArray(model.options)) {
-    flatten(model.options);
-    return acpModelCatalog(executable, version, entries, typeof model.currentValue === "string" ? model.currentValue : undefined);
-  }
   if (Array.isArray(data.models?.availableModels)) {
     for (const entry of data.models.availableModels) {
       if (typeof entry?.modelId === "string" && entry.modelId) entries.push([entry.modelId, typeof entry.name === "string" ? entry.name : entry.modelId]);
     }
-    return acpModelCatalog(executable, version, entries, data.models.currentModelId);
+    return acpModelCatalog(executable, version, entries, typeof data.models.currentModelId === "string" ? data.models.currentModelId : undefined);
+  }
+  const model = Array.isArray(data.configOptions)
+    ? data.configOptions.find((option: any) => option?.category === "model") ?? data.configOptions.find((option: any) => option?.id === "model")
+    : undefined;
+  if (model && Array.isArray(model.options)) {
+    flatten(model.options);
+    return acpModelCatalog(executable, version, entries, typeof model.currentValue === "string" ? model.currentValue : undefined);
   }
 }
 

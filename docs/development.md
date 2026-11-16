@@ -64,6 +64,84 @@ or tool response is emitted. Completed receipt replays retain their original
 response payload. A replacement execution cannot inherit the previous
 generation's occupancy.
 
+## Plugin response receipts
+
+HostBridge stores each HTTP response's own ACP event slice in the existing
+request receipt, not the whole native turn. Tool-result continuations derive
+their frozen identity from the originating request, original inbound content,
+and execution profile; changing the message header or omitting assistant call
+blocks must not bypass replay protection.
+
+Only a matching digest and a complete successful `end_turn` slice can replay.
+Replay does not rewrite the snapshot or renew its retention timestamp. A
+duplicate partial response keeps the original MCP waiter parked; it does not
+re-expose tool calls. Cancelled, interrupted, missing, or unavailable snapshots
+fail closed. Completed snapshots must persist before emitting success, and a
+failed commit must not leave a successful replay. Cached harness failures still
+retire the worker and disable session recovery.
+
+## ACP release pin and isolation
+
+This unreleased migration uses official Antigravity CLI **1.5.9**, build
+`4515810895593472`, as the ACP backend, not the registry's PAR distribution.
+The temporary runtime gate allows only reviewed Linux x64 execution.
+Windows x64 and macOS ARM64 retain pinned assets and offline checks, but
+credential selection, refresh destinations and process-tree cleanup require
+native acceptance before runtime approval. Static hashes do not establish
+authenticated platform support.
+
+`src/acp-install.ts` records the official release URLs and SHA-512 payload
+pins. Downloads are bounded while reading and do not follow redirects.
+The whole payload is authenticated before Unix archives are read in memory
+with Bun 1.4.4's `Bun.Archive`; only the named `antigravity` member is accepted.
+Windows uses a bare `antigravity.exe`. Actual executable size and SHA-256 are
+checked before atomic installation and when reusing the managed executable.
+`src/acp-compatibility.ts` checks executable bytes, never version text.
+
+The managed directory is `antigravity-cli-1.5.9` under the plugin data root.
+`OPENCODE_ANTIGRAVITY_CLI_PATH` can select only the same pinned executable.
+Legacy `OPENCODE_ANTIGRAVITY_ACP_PATH` and
+`OPENCODE_ANTIGRAVITY_ACP_ARGS` fail explicitly; there is no `CLI_ARGS` bypass
+or PAR/companion fallback. A CLI upgrade must update asset pins, executable
+profiles, CI downloads and regression tests together.
+
+`src/cli-agent.ts` owns the fixed `opencode-antigravity` agent, its complete
+Markdown digest and session arguments:
+
+```text
+acp --gemini-dir <private-home> --app-data-dir agy \
+  --agent opencode-antigravity --process-per-session --disable-telemetry
+```
+
+The agent requests `tools: []`, `excludeDefaultComponents: true` and
+`mainAgent: true`. The isolated 1.5.9 capability check recorded only the
+128-byte custom system body and its wrapper, but still declared
+`manage_task`, also reported in
+[upstream issue #1015](https://github.com/google-antigravity/antigravity-cli/issues/1015).
+Default-body removal is not zero-native-tool isolation; this tool has not
+been shown to be controlled by the ACP permission gate.
+Host instructions retain the existing reconstruction path, not prompt
+rewriting or `systemPrompt.append`.
+
+The plugin and service each derive the permission registry from their actual
+MCP `tools/list`. Permission requires the exact registered machine name,
+current session, a matching previously observed `toolCallId`, and
+`allow_once`; titles, prefixes and legacy `_meta.mcp` are not identities.
+Agent and registry fingerprints affect worker `settingsSignature` and
+`executionProfile`, not HostBridge continuation IDs or receipt keys.
+
+The Linux runtime uses a private home/app-data directory and the complete
+personal credential selected by the existing resolver. It checks the source
+for each new worker, preserves refreshed private credentials, and does not
+write the source login. The child environment excludes alternate API/ADC
+authentication and uses the reviewed private D-Bus isolation. Historical
+settings/ADC/API inputs retained by `effectiveAuth` are identity inputs only,
+not Native authentication selectors.
+
+Changing the ACP executable also changes the catalog and tool-ledger scope.
+Finish pending host-tool round trips before switching versions; do not rewrite
+old ledger keys to bypass ownership checks during recovery.
+
 ## Optional live tests
 
 The default suite uses fixtures and skips opt-in live and platform-specific
@@ -76,10 +154,12 @@ account quota. See `test/acp-live.test.ts` and `src/acp-detect.ts` for the check
 and executable discovery behavior. Do not commit credentials or local `.env`
 files.
 
-## Verified baseline
+## Earlier PAR baseline (historical)
 
-Setup was verified with Bun 1.4.4: the build succeeded, with 205 tests passing,
-10 skipped, and no failures.
+An earlier PAR setup was verified with Bun 1.4.4: the build succeeded, with
+205 tests passing, 10 skipped, and no failures. These totals are not CLI
+migration acceptance. Fixture protocol tests and the isolated CLI capability
+check do not replace real plugin/service entrypoint checks.
 
 A prior lockfile audit reported 4 dependency vulnerabilities (1 moderate,
 3 high). Dependency upgrades were deliberately left out of this migration;
@@ -166,9 +246,10 @@ bun run build:service
 
 Copy `dist/agy-api` to the target machine. It includes Bun and the native
 file-lock addon. Provision a dedicated agy CLI login directory and set
-`AGY_CREDENTIALS_DIR` to it. The service uses its consumer login, and discovers
-or downloads the official ACP executable and its companion. Set
-`OPENCODE_ANTIGRAVITY_ACP_PATH` to use an existing compatible installation.
+`AGY_CREDENTIALS_DIR` to it. The service reads its consumer login and derives
+private runtime credentials; it discovers or downloads the pinned official
+CLI executable. Set `OPENCODE_ANTIGRAVITY_CLI_PATH` to use an existing
+pin-compatible executable. Legacy ACP executable/argument overrides are rejected.
 
 Set `AGY_API_KEY` to a random secret of at least 32 bytes before starting.
 `AGY_HOST` defaults to `127.0.0.1` and `AGY_PORT` defaults to `8787`.

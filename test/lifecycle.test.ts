@@ -1,8 +1,10 @@
 import { chmod, mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
-import { useFixtureAuthentication } from "./fixtures/compatibility.js";
-useFixtureAuthentication();
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { fixtureCompatibility } from "./fixtures/compatibility.js";
+let compatibility: ReturnType<typeof fixtureCompatibility>;
+beforeAll(() => { compatibility = fixtureCompatibility(); });
+afterAll(() => { compatibility.mockRestore(); });
 import { SessionPool } from "../src/session-pool.js";
 import { SessionStore } from "../src/session-store.js";
 import { canonical, extendsBoundary, fingerprints } from "../src/coordinator.js";

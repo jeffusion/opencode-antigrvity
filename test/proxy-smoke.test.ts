@@ -10,7 +10,6 @@ import { getProxyRuntime } from "../src/proxy.js";
 let compatibility: ReturnType<typeof fixtureCompatibility>;
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
-process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
 process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(join(tmpdir(), "opencode-antigravity-test-"));
 process.env.GEMINI_HOME = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR, "gemini-home");
 delete process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD;

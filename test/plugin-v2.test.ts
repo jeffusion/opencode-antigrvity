@@ -27,7 +27,7 @@ const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const temporaryDirectories: string[] = [];
 const cleanupTasks: Array<() => Promise<void>> = [];
 const savedEnvironment = new Map<string, string | undefined>();
-const environmentKeys = ["OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_PROMPT_LOG", "FAKE_ACP_RPC_LOG"];
+const environmentKeys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_PROMPT_LOG", "FAKE_ACP_RPC_LOG"];
 
 afterEach(async () => {
   await Promise.all(cleanupTasks.splice(0).map((cleanup) => cleanup()));
@@ -52,7 +52,6 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const sessionDirectory = await temporaryDirectory("agy-v2-session-");
   const concurrentDirectory = await temporaryDirectory("agy-v2-concurrent-session-");
   const geminiHome = await temporaryDirectory("agy-v2-gemini-");
-  process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
   process.env.GEMINI_HOME = geminiHome;
   process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";

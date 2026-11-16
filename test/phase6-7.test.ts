@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
-import { useFixtureAuthentication } from "./fixtures/compatibility.js";
-useFixtureAuthentication();
+import { fixtureCompatibility } from "./fixtures/compatibility.js";
 import { mkdtemp, writeFile, readFile, readdir, mkdir, rm, utimes } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -28,6 +27,7 @@ async function isolatedData(): Promise<() => Promise<void>> {
 }
 
 test("successful turns do not accumulate abort listeners", async () => {
+  const compatibility = fixtureCompatibility();
   const restore = await isolatedData();
   const pool = new SessionPool();
   const controller = new AbortController();
@@ -40,10 +40,11 @@ test("successful turns do not accumulate abort listeners", async () => {
       expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
       expect(getEventListeners(signal, "abort")).toHaveLength(baseline);
     }
-  } finally { await pool.close(); await restore(); }
+  } finally { compatibility.mockRestore(); await pool.close(); await restore(); }
 });
 
 test("fake ACP turn recovers a stale session-store chain and completes its durable receipt", async () => {
+  const compatibility = fixtureCompatibility();
   const restore = await isolatedData();
   const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
   const pool = new SessionPool();
@@ -71,10 +72,11 @@ test("fake ACP turn recovers a stale session-store chain and completes its durab
 
     expect((await new SessionStore().receipt(key, requestId))?.state).toBe("completed");
     expect(await readdir(root)).not.toContain("sessions.lock");
-  } finally { await pool.close(); await restore(); }
+  } finally { compatibility.mockRestore(); await pool.close(); await restore(); }
 });
 
 test("capacity evicts completed idle workers and never evicts active work", async () => {
+  const compatibility = fixtureCompatibility();
   const restore = await isolatedData();
   const oldCapacity = process.env.OPENCODE_ANTIGRAVITY_MAX_SESSIONS;
   process.env.OPENCODE_ANTIGRAVITY_MAX_SESSIONS = "1";
@@ -102,6 +104,7 @@ test("capacity evicts completed idle workers and never evicts active work", asyn
     await pool.close();
     expect(await outcome).toMatchObject({ error: { code: "agy_cancelled" } });
   } finally {
+    compatibility.mockRestore();
     await pool.close();
     if (oldCapacity === undefined) delete process.env.OPENCODE_ANTIGRAVITY_MAX_SESSIONS; else process.env.OPENCODE_ANTIGRAVITY_MAX_SESSIONS = oldCapacity;
     await restore();
